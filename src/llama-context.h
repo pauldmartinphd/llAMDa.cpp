@@ -90,8 +90,10 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    bool get_embeddings_nextn_device(llama_device_view & view) const;
 
     float * get_embeddings_layer_inp(uint32_t lid);
+    bool get_embeddings_layer_inp_device(uint32_t lid, llama_device_view & view) const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -119,10 +121,14 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_embeddings_nextn_device_preferred(bool value);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_embeddings_layer_inp_device_preferred(uint32_t lid, bool value);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+
+    bool resize_recurrent_memory(uint32_t new_n_seq_max, bool expand);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -235,6 +241,7 @@ private:
     uint32_t output_reserve(int32_t n_outputs);
 
     void output_reorder();
+    void materialize_device_outputs();
 
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
@@ -325,6 +332,34 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
+
+    struct device_output_view {
+        const ggml_tensor * tensor = nullptr;
+        ggml_backend_t backend = nullptr;
+        uint32_t n_rows = 0;
+        bool valid = false;
+    };
+
+    struct pending_device_copy {
+        const ggml_tensor * tensor = nullptr;
+        ggml_backend_t backend = nullptr;
+        void * dst = nullptr;
+        size_t size = 0;
+    };
+
+    // Borrowed single-ubatch device views. They are invalidated before every
+    // evaluation and are only exposed to same-backend integrations.
+    bool device_views_valid = false;
+    device_output_view embd_nextn_device;
+    std::vector<device_output_view> embd_layer_inp_device;
+
+    // Device-preferred output keeps host copies off the target stream when the
+    // sidecar can consume the tensor directly. Host getters materialize these
+    // spans on demand, including the multi-ubatch fallback.
+    bool embd_nextn_device_preferred = false;
+    std::vector<bool> embd_layer_inp_device_preferred;
+    std::vector<pending_device_copy> pending_embd_nextn_copies;
+    std::vector<std::vector<pending_device_copy>> pending_embd_layer_inp_copies;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

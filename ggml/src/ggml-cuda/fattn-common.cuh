@@ -41,6 +41,18 @@ typedef void (* fattn_kernel_t)(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33);
 
+static inline bool ggml_cuda_fattn_use_gfx1030_native() {
+#if defined(GGML_USE_HIP)
+    if (!ggml_cuda_rdna2_native_profile_enabled()) {
+        return false;
+    }
+    const int device = ggml_cuda_get_device();
+    return GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[device].cc);
+#else
+    return false;
+#endif
+}
+
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
 
@@ -1135,6 +1147,18 @@ void launch_fattn(
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+#if defined(GGML_USE_HIP)
+    // HIP can report a false zero occupancy for the RDNA2 D=256 tile kernels even though a one-block/SM launch is valid.
+    if (max_blocks_per_sm <= 0 && GGML_CUDA_CC_IS_RDNA2(cc) && Q->ne[0] == 256 && DV == 256) {
+        static std::once_flag warning_once;
+        std::call_once(warning_once, [=]() {
+            GGML_LOG_WARN(
+                "launch_fattn: HIP occupancy query returned %d on device %d (gfx%x) for DV=%d, ncols1=%d, ncols2=%d; using one block/SM\n",
+                max_blocks_per_sm, id, cc & 0xffff, DV, ncols1, ncols2);
+        });
+        max_blocks_per_sm = 1;
+    }
+#endif
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 

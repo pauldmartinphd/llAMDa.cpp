@@ -405,6 +405,11 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
+
+    if (size == 0) {
+        return;
+    }
+
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
@@ -419,6 +424,11 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
 void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
+
+    if (size == 0) {
+        return;
+    }
+
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
@@ -905,7 +915,9 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#define GGML_SCHED_MAX_SPLIT_INPUTS 30
+// DeepSeek V4 HC + speculative graphs can carry more than 30 cross-backend
+// inputs when their layers are distributed over several devices.
+#define GGML_SCHED_MAX_SPLIT_INPUTS 128
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES
@@ -1883,9 +1895,54 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // Host inputs must be copied before this function returns so callers can
+        // immediately reuse their storage. When the destination supports asynchronous
+        // writes, queue all compatible inputs together and synchronize once instead of
+        // serializing every small transfer independently.
+        auto can_batch_host_input = [&](int input_id) {
+            struct ggml_tensor * input = split->inputs[input_id];
+            if (!(input->flags & GGML_TENSOR_FLAG_INPUT) || split_backend->iface.set_tensor_async == nullptr) {
+                return false;
+            }
+            ggml_backend_buffer_t input_buffer = input->view_src ? input->view_src->buffer : input->buffer;
+            struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            return input_buffer != nullptr && ggml_backend_buffer_is_host(input_buffer) &&
+                ggml_nbytes(input) > 0 && ggml_nbytes(input_cpy) > 0 &&
+                ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy);
+        };
+
+        static constexpr int min_batched_host_inputs = 8;
+        int n_batched_host_inputs = 0;
+        for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+            n_batched_host_inputs += can_batch_host_input(input_id);
+        }
+        // A small group does not amortize the two synchronization calls.
+        if (n_batched_host_inputs >= min_batched_host_inputs) {
+            // Protect the reused destination buffers before queuing any writes.
+            if (sched->events[split_backend_id][sched->cur_copy] != nullptr) {
+                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
+            for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+                if (!can_batch_host_input(input_id)) {
+                    continue;
+                }
+                struct ggml_tensor * input = split->inputs[input_id];
+                struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+            }
+            // This preserves the public input-lifetime contract while amortizing the
+            // synchronization over the whole batch.
+            ggml_backend_synchronize(split_backend);
+        }
+
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (n_batched_host_inputs >= min_batched_host_inputs && can_batch_host_input(input_id)) {
+                continue;
+            }
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }

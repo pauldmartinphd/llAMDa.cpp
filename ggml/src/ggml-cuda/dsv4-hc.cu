@@ -1,9 +1,323 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "unary.cuh"
+
+#include <cstdlib>
+#include <cstring>
 
 
 static constexpr int DSV4_HC = 4;
 
+
+static bool dsv4_hc_mixes_override_enabled() {
+#if defined(GGML_USE_HIP)
+    static const bool value = []() {
+        const char * env = std::getenv("GGML_HIP_RDNA2_HC_MIXES");
+        if (!env) {
+            return true;
+        }
+        if (std::strcmp(env, "0") == 0) {
+            return false;
+        }
+        if (std::strcmp(env, "1") == 0) {
+            return true;
+        }
+
+        fprintf(stderr, "GGML_HIP_RDNA2_HC_MIXES must be 0 or 1 (got '%s')\n", env);
+        GGML_ABORT("invalid RDNA2 DSV4 hc_mixes override");
+    }();
+    return value;
+#else
+    return false;
+#endif
+}
+
+bool ggml_cuda_use_qwen4exp_hc_combine() {
+#if defined(GGML_USE_HIP)
+    static const bool value = []() {
+        const char * env = std::getenv("GGML_HIP_QWEN4EXP_HC_COMBINE");
+        if (env == nullptr || std::strcmp(env, "0") == 0) {
+            return false;
+        }
+        if (std::strcmp(env, "1") == 0) {
+            return true;
+        }
+        fprintf(stderr, "GGML_HIP_QWEN4EXP_HC_COMBINE must be 0 or 1 (got '%s')\n", env);
+        GGML_ABORT("invalid Qwen4Exp HC combine override");
+    }();
+    return value;
+#else
+    return false;
+#endif
+}
+
+static __global__ void qwen4exp_hc_combine_f32(
+        const float * residual,
+        const float * block_repeat,
+        const float * inject,
+        float *       dst,
+        int64_t       n_embd,
+        int64_t       hc,
+        int64_t       n_tokens) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t n = n_embd * hc * n_tokens;
+    if (i >= n) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    const int64_t ih = (i / n_embd) % hc;
+    const int64_t it = i / (n_embd * hc);
+    const float inject_scaled = 0.25f * inject[ih + hc * it];
+    const float weight_sigmoid = 1.0f / (1.0f + expf(-inject_scaled));
+    const float weight_scaled = 2.0f * weight_sigmoid;
+    volatile float product = block_repeat[i] * weight_scaled;
+    dst[i] = residual[i] + product;
+}
+
+bool ggml_cuda_op_qwen4exp_hc_combine(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * residual,
+        const ggml_tensor * block_repeat,
+        const ggml_tensor * inject,
+        ggml_tensor * dst) {
+    if (!ggml_cuda_use_qwen4exp_hc_combine()) {
+        return false;
+    }
+    if (residual->type != GGML_TYPE_F32 || block_repeat->type != GGML_TYPE_F32 ||
+            inject->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            residual->ne[0] != 2560 || residual->ne[1] != 4 || residual->ne[3] != 1 ||
+            !ggml_are_same_shape(residual, block_repeat) || !ggml_are_same_shape(residual, dst) ||
+            inject->ne[0] != 4 || inject->ne[1] != residual->ne[2] ||
+            inject->ne[2] != 1 || inject->ne[3] != 1 ||
+            !ggml_is_contiguous(residual) || !ggml_is_contiguous(block_repeat) ||
+            !ggml_is_contiguous(inject) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int64_t n = ggml_nelements(dst);
+    const int block_size = 256;
+    const ggml_cuda_kernel_launch_params launch_params(
+            (n + block_size - 1) / block_size, block_size, 0, ctx.stream());
+    ggml_cuda_kernel_launch(qwen4exp_hc_combine_f32, launch_params,
+            (const float *) residual->data, (const float *) block_repeat->data,
+            (const float *) inject->data, (float *) dst->data,
+            residual->ne[0], residual->ne[1], residual->ne[2]);
+    return true;
+}
+
+bool ggml_cuda_use_qwen4exp_hc_reduce() {
+#if defined(GGML_USE_HIP)
+    static const bool value = []() {
+        const char * env = std::getenv("GGML_HIP_QWEN4EXP_HC_REDUCE");
+        if (env == nullptr || std::strcmp(env, "0") == 0) {
+            return false;
+        }
+        if (std::strcmp(env, "1") == 0) {
+            return true;
+        }
+        fprintf(stderr, "GGML_HIP_QWEN4EXP_HC_REDUCE must be 0 or 1 (got '%s')\n", env);
+        GGML_ABORT("invalid Qwen4Exp HC reduce override");
+    }();
+    return value;
+#else
+    return false;
+#endif
+}
+
+bool ggml_cuda_use_qwen4exp_hc_scale_silu() {
+#if defined(GGML_USE_HIP)
+    static const bool value = []() {
+        const char * env = std::getenv("GGML_HIP_QWEN4EXP_HC_SCALE_SILU");
+        if (env == nullptr || std::strcmp(env, "0") == 0) {
+            return false;
+        }
+        if (std::strcmp(env, "1") == 0) {
+            return true;
+        }
+        fprintf(stderr, "GGML_HIP_QWEN4EXP_HC_SCALE_SILU must be 0 or 1 (got '%s')\n", env);
+        GGML_ABORT("invalid Qwen4Exp HC scale-SiLU override");
+    }();
+    return value;
+#else
+    return false;
+#endif
+}
+
+static __global__ void qwen4exp_hc_reduce_f32(
+        const float * streams,
+        float *       dst,
+        int64_t       n_embd,
+        int64_t       n_tokens) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t n = n_embd * n_tokens;
+    if (i >= n) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    const int64_t i0 = i % n_embd;
+    const int64_t it = i / n_embd;
+    const int64_t base = i0 + 4 * n_embd * it;
+    volatile float sum = streams[base];
+    sum = sum + streams[base + n_embd];
+    sum = sum + streams[base + 2 * n_embd];
+    sum = sum + streams[base + 3 * n_embd];
+    dst[i] = 0.25f * sum;
+}
+
+bool ggml_cuda_op_qwen4exp_hc_reduce(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * streams,
+        ggml_tensor * dst) {
+    if (!ggml_cuda_use_qwen4exp_hc_reduce()) {
+        return false;
+    }
+    if (streams->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            dst->ne[0] != 2560 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            ggml_nelements(streams) != 4 * ggml_nelements(dst) ||
+            !ggml_is_contiguous(streams) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int64_t n = ggml_nelements(dst);
+    const int block_size = 256;
+    const ggml_cuda_kernel_launch_params launch_params(
+            (n + block_size - 1) / block_size, block_size, 0, ctx.stream());
+    ggml_cuda_kernel_launch(qwen4exp_hc_reduce_f32, launch_params,
+            (const float *) streams->data, (float *) dst->data,
+            dst->ne[0], dst->ne[1]);
+    return true;
+}
+
+static __global__ void qwen4exp_hc_scale_silu_f32(
+        const float * src,
+        float *       dst,
+        int64_t       n) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    volatile float scaled = 0.25f * src[i];
+    dst[i] = ggml_cuda_op_silu_single(scaled);
+}
+
+bool ggml_cuda_op_qwen4exp_hc_scale_silu(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        ggml_tensor * dst) {
+    if (!ggml_cuda_use_qwen4exp_hc_scale_silu()) {
+        return false;
+    }
+    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            src->ne[0] != 320 || src->ne[2] != 1 || src->ne[3] != 1 ||
+            !ggml_are_same_shape(src, dst) ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int64_t n = ggml_nelements(dst);
+    const int block_size = 256;
+    const ggml_cuda_kernel_launch_params launch_params(
+            (n + block_size - 1) / block_size, block_size, 0, ctx.stream());
+    ggml_cuda_kernel_launch(qwen4exp_hc_scale_silu_f32, launch_params,
+            (const float *) src->data, (float *) dst->data, n);
+    return true;
+}
+
+// Specialized kernel for the exact DSV4 hidden-channel mixer shape; env 0 is a diagnostic control:
+// C[M,N] = A[K,M]^T * B[K,N], with M=24, N=256, K=16384.
+// Each thread owns one output and the block cooperatively stages A/B in LDS.
+template <int tile_m, int tile_n, int tile_k>
+static __global__ void dsv4_hc_mixes_f32(
+        const float * __restrict__ src0,
+        const float * __restrict__ src1,
+        float * __restrict__ dst) {
+    constexpr int k = 16384;
+    constexpr int m = 24;
+    constexpr int n = 256;
+    constexpr int nthreads = tile_m * tile_n;
+
+    static_assert(k % tile_k == 0, "tile_k must divide K");
+    static_assert(nthreads <= 256, "hc_mixes block is too large");
+
+    __shared__ float tile_a[tile_m][tile_k + 1];
+    __shared__ float tile_b[tile_n][tile_k + 1];
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    const int tid = threadIdx.x;
+    const int local_row = tid / tile_n;
+    const int local_col = tid % tile_n;
+    const int row = blockIdx.y * tile_m + local_row;
+    const int col = blockIdx.x * tile_n + local_col;
+    float sum = 0.0f;
+
+#pragma unroll 1
+    for (int k0 = 0; k0 < k; k0 += tile_k) {
+        for (int i = tid; i < tile_m * tile_k; i += nthreads) {
+            const int load_row = i / tile_k;
+            const int load_k = i % tile_k;
+            const int global_row = blockIdx.y * tile_m + load_row;
+            tile_a[load_row][load_k] = global_row < m ? src0[global_row * k + k0 + load_k] : 0.0f;
+        }
+        for (int i = tid; i < tile_n * tile_k; i += nthreads) {
+            const int load_col = i / tile_k;
+            const int load_k = i % tile_k;
+            const int global_col = blockIdx.x * tile_n + load_col;
+            tile_b[load_col][load_k] = global_col < n ? src1[global_col * k + k0 + load_k] : 0.0f;
+        }
+        __syncthreads();
+
+        if (row < m && col < n) {
+#pragma unroll
+            for (int ik = 0; ik < tile_k; ++ik) {
+                sum = fmaf(tile_a[local_row][ik], tile_b[local_col][ik], sum);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row < m && col < n) {
+        dst[col * m + row] = sum;
+    }
+}
+
+bool ggml_cuda_op_dsv4_hc_mixes(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst,
+        int cc,
+        int warp_size) {
+    if (!dsv4_hc_mixes_override_enabled() || !GGML_CUDA_CC_IS_RDNA2(cc) || warp_size != 32) {
+        return false;
+    }
+
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src0->ne[0] != 16384 || src0->ne[1] != 24 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[0] != 16384 || src1->ne[1] != 256 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        dst->ne[0] != 24 || dst->ne[1] != 256 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    constexpr int tile_m = 12;
+    constexpr int tile_n = 16;
+    constexpr int tile_k = 256;
+    const dim3 blocks(256 / tile_n, 24 / tile_m, 1);
+    const dim3 threads(tile_m * tile_n, 1, 1);
+    ggml_cuda_kernel_launch(dsv4_hc_mixes_f32<tile_m, tile_n, tile_k>,
+            ggml_cuda_kernel_launch_params(blocks, threads, 0, ctx.stream()),
+            (const float *) src0->data, (const float *) src1->data, (float *) dst->data);
+    return true;
+}
 
 static __device__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
     for (int idst = 0; idst < DSV4_HC; ++idst) {

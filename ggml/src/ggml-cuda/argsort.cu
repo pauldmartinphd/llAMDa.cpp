@@ -1,9 +1,13 @@
 #include "argsort.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
-#    include <cub/cub.cuh>
-    // strided_iterator was added in CCCL 3.1
-#    if (CCCL_MAJOR_VERSION > 3 || (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION >= 1))
+#    if defined(GGML_USE_HIP)
+#        include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#    else
+#        include <cub/cub.cuh>
+#    endif
+#    if !defined(GGML_USE_HIP) && (CCCL_MAJOR_VERSION > 3 || (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION >= 1))
 #        define STRIDED_ITERATOR_AVAILABLE
 #        include <cuda/iterator>
 #    endif
@@ -250,6 +254,8 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     const dim3 block_nums(nrows, 1, 1);
     const size_t shared_mem = ncols_pad * sizeof(int);
 
+    // the shared memory budget is the limit on ncols_pad - keep this in sync with the check in
+    // ggml_backend_cuda_device_supports_op() so that larger rows fall back instead of aborting
     // FIXME: this limit could be raised by ~2-4x on Ampere or newer
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 

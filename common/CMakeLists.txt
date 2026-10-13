@@ -107,6 +107,12 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    speculative-content.cpp
+    speculative-content.h
+    spec_sidecar.cpp
+    spec_sidecar.h
+    spec_sidecar_assets.cpp
+    spec_sidecar_assets.h
     subproc.cpp
     subproc.h
     trie.cpp
@@ -135,6 +141,7 @@ set_target_properties(${TARGET} PROPERTIES
 
 target_include_directories(${TARGET} PUBLIC .)
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
+target_link_libraries     (${TARGET} PRIVATE vendor::hash)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (LLAMA_SUBPROCESS)
@@ -149,7 +156,7 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 target_link_libraries(${TARGET} PUBLIC  llama-common-base)
-target_link_libraries(${TARGET} PRIVATE cpp-httplib)
+target_link_libraries(${TARGET} PRIVATE cpp-httplib ${CMAKE_DL_LIBS})
 
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)

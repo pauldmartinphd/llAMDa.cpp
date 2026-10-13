@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "ggml-backend.h"
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
@@ -21,14 +22,15 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     }
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-    ml.get_key(LLM_KV_LOGIT_SCALE,                 hparams.f_logit_scale, false);
+    ml.get_key(LLM_KV_LOGIT_SCALE,                  hparams.f_logit_scale, false);
     hparams.f_final_logit_softcapping = 0.0f;
-    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
+    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,      hparams.f_final_logit_softcapping, false);
+    ml.get_key(LLM_KV_EMBEDDING_SCALE,              hparams.f_embedding_scale, false);
 
-    // drafts for M-RoPE targets carry degenerate sections [n_rot/2, 0, 0, 0]
+    ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,        hparams.dflash_block_size,       false);
+
+    // Drafts for M-RoPE targets carry degenerate sections [n_rot/2, 0, 0, 0].
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
-
-    ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,       hparams.dflash_block_size,       false);
     ml.get_key(LLM_KV_DFLASH_CONV_KERNEL_SIZE, hparams.dflash_conv_kernel_size, false);
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
@@ -360,7 +362,7 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
 
 // DFlash Encoder: processes target model features through feature fusion layer
 template <>
-llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params), model(model) {
     ggml_tensor * cur = build_inp_embd_enc();
 
     cur = build_lora_mm(model.fc, cur, model.fc_s);
@@ -508,14 +510,10 @@ static ggml_tensor * build_dflash2_conv(
 
     const int64_t block_size = n_tokens / n_blocks;
     ggml_context * ctx0 = g.ctx0;
-    // ggml_cont copies even when the tensor is already contiguous
-    if (!ggml_is_contiguous(hidden) || hidden->ne[1] != n_tokens) {
-        hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
-    }
-    if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
-        dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
-    }
+    hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
+    dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
+    ggml_tensor * grouped = ggml_reshape_3d(ctx0, hidden, group_size, n_groups, n_tokens);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
             coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
@@ -543,11 +541,15 @@ static ggml_tensor * build_dflash2_conv(
         }
         values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
 
-        ggml_tensor * weight = ggml_reshape_2d(ctx0,
-                ggml_cont(ctx0, ggml_view_4d(ctx0, weight_all, group_size, n_groups, 1, n_tokens,
-                        weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2])),
-                hidden_size, n_tokens);
+        ggml_tensor * coeff = ggml_view_2d(ctx0, coeffs_side, n_groups, n_tokens,
+                coeffs_side->nb[2], tap * coeffs_side->nb[1]);
+        coeff = ggml_cont(ctx0, coeff);
+        coeff = ggml_reshape_3d(ctx0, coeff, 1, n_groups, n_tokens);
+        coeff = ggml_reshape_2d(ctx0, ggml_repeat(ctx0, coeff, grouped), hidden_size, n_tokens);
 
+        ggml_tensor * base_tap = ggml_view_1d(ctx0, base, hidden_size,
+                tap * base->nb[1] + side * base->nb[2]);
+        ggml_tensor * weight = ggml_add(ctx0, coeff, ggml_repeat(ctx0, base_tap, hidden));
         ggml_tensor * term = ggml_mul(ctx0, weight, values);
         result = result ? ggml_add(ctx0, result, term) : term;
     }
@@ -813,7 +815,7 @@ static void build_lilicorr_scores(llm_graph_context & g, const llama_model & mod
 //   * embd batch  -> fused target features: project + inject K/V into the cache.
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
 template <>
-llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params), model(model) {
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
@@ -1008,6 +1010,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             cb(cur, "attn_conv_out", il);
         }
 
+        if (attn_dynamic) {
+            cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
+            cb(cur, "attn_conv_out", il);
+        }
         if (layer.attn_post_norm) {
             cur = build_norm(cur, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
             cb(cur, "attn_post_norm", il);
@@ -1069,19 +1075,22 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         output_s = model_other->output_s;
     }
 
+    if (output->buffer != nullptr && ggml_backend_buffer_is_meta(output->buffer)) {
+        ggml_tensor * concrete = ggml_backend_meta_get_simple_tensor(output, 0);
+        GGML_ASSERT(concrete->ne[0] == output->ne[0] && concrete->ne[1] == output->ne[1] &&
+                "DFlash requires a mirrored target output head");
+        output = concrete;
+    }
+
     cur = build_lora_mm(output, cur, output_s);
 
-    // DFlash2 feeds these logits to the selector, so they need the target's output
-    // transforms; DFlash1 and DSpark read them through the sampler instead
-    if (model.dflash_selector_hidden) {
-        if (hparams.f_logit_scale != 0.0f) {
-            cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
-        }
-        if (hparams.f_final_logit_softcapping > 0.0f) {
-            cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
-            cur = ggml_tanh(ctx0, cur);
-            cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
-        }
+    if (hparams.f_logit_scale != 0.0f) {
+        cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
+    }
+    if (hparams.f_final_logit_softcapping > 0.0f) {
+        cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
+        cur = ggml_tanh(ctx0, cur);
+        cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
     }
 
     // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
@@ -1107,10 +1116,18 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         build_dspark_markov_head(*this, model, inp_tokens);
     }
 
-    if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens);
-    } else if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
+    if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
         build_lilicorr_scores(*this, model, tok_embd, inp_anchor);
+    }
+
+}
+
+template <bool is_enc>
+void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
+    if constexpr (!is_enc) {
+        if (model.dflash_selector_hidden && res->t_logits) {
+            build_dflash2_selector(*const_cast<graph *>(this), model, res->get_inp_tokens());
+        }
     }
 }
 
@@ -1277,6 +1294,13 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires the target model's output projection");
         output   = model_other->output;
         output_s = model_other->output_s;
+    }
+
+    if (output->buffer != nullptr && ggml_backend_buffer_is_meta(output->buffer)) {
+        ggml_tensor * concrete = ggml_backend_meta_get_simple_tensor(output, 0);
+        GGML_ASSERT(concrete->ne[0] == output->ne[0] && concrete->ne[1] == output->ne[1] &&
+                "DFlash requires a mirrored target output head");
+        output = concrete;
     }
 
     cur = build_lora_mm(output, cur, output_s);

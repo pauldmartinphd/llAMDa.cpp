@@ -4304,8 +4304,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
     add_opt(common_arg(
+        {"--spec-sidecar-cache"}, "DIR",
+        "cache root for automatically prepared speculative sidecar assets\n"
+        "(default: $LLAMA_CACHE/spec-sidecar or the platform cache directory)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.sidecar_cache = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SIDECAR_CACHE"));
+    add_opt(common_arg(
         {"--spec-draft-model", "-md", "--model-draft"}, "FNAME",
-        "draft model for speculative decoding (default: unused)",
+        "draft model for speculative decoding; with SPEC_SIDECAR=1, supported DFlash/Qwen4Exp GGUFs are automatically converted to cached provider assets (default: unused)",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.mparams.path = value;
             params.speculative.draft.mparams.hf_file = value; // will be used if --spec-draft-hf is set

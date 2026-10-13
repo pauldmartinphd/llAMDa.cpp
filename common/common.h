@@ -63,6 +63,7 @@ struct common_adapter_lora_info {
 using llama_tokens = std::vector<llama_token>;
 
 struct common_control_vector_load_info;
+struct common_spec_sidecar_profile;
 
 //
 // CPU utils
@@ -329,6 +330,7 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
@@ -340,6 +342,31 @@ struct common_params_speculative_draft {
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
+
+    // Set internally after a sidecar ABI/artifact probe succeeds. In this
+    // mode the optional sidecar owns draft execution and no host draft model
+    // or draft context is created; runtime initialization failure fails closed
+    // to target-only rather than loading a late fallback model.
+    bool sidecar_only = false;
+    common_speculative_type sidecar_type = COMMON_SPECULATIVE_TYPE_NONE;
+    const common_spec_sidecar_profile * sidecar_profile = nullptr;
+
+    // Internal runtime qualification gate for content-aware stacked K4V
+    // verification. A successful sidecar probe alone is insufficient: the
+    // caller must also certify the provider/topology/capacity envelope. This
+    // flag never authorizes a wider neural draft.
+    bool content_verification_eligible = false;
+
+    // Resolved before target-model loading so the output-head placement probe,
+    // post-load preflight, and runtime loader consume one atomic artifact set.
+    bool sidecar_prepare_attempted = false;
+    bool sidecar_candidate_ready = false;
+    bool sidecar_dflash_full_head = false;
+    std::string sidecar_profile_name;
+    std::string sidecar_library;
+    std::string sidecar_artifact_dir;
+    std::string sidecar_ids;
+    std::string sidecar_prepare_error;
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
@@ -376,6 +403,10 @@ struct common_params_speculative_ngram_cache {
 
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+
+    // Empty uses ${LLAMA_CACHE}/spec-sidecar (or the platform cache default).
+    // Generated bundles are profile/source keyed below this root.
+    std::string sidecar_cache;
 
     double synth_len = -1.0;
     std::vector<double> synth_rates;
@@ -1069,6 +1100,8 @@ struct common_memory {
 
     // aborts execution on failure
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    // M-RoPE target positions can diverge from the dense one-row-per-token draft positions.
+    void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p0_dft) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
 };

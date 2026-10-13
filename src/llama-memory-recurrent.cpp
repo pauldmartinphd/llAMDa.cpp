@@ -25,7 +25,16 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+    const layer_filter_cb & filter,
+                 uint32_t   n_embd_r_override,
+                 uint32_t   n_embd_s_override,
+       const std::string & name_prefix) :
+    hparams(model.hparams),
+    n_embd_r(n_embd_r_override ? n_embd_r_override : hparams.n_embd_r()),
+    n_embd_s(n_embd_s_override ? n_embd_s_override : hparams.n_embd_s()),
+    name_prefix(name_prefix),
+    n_seq_max(n_seq_max) {
+    GGML_ASSERT(!name_prefix.empty());
     const int32_t n_layer = hparams.n_layer();
 
     head = 0;
@@ -99,10 +108,10 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
-        ggml_format_name(r, "cache_r_l%d", i);
-        ggml_format_name(s, "cache_s_l%d", i);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, n_embd_r, n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, n_embd_s, n_rows);
+        ggml_format_name(r, "%s_r_l%d", name_prefix.c_str(), i);
+        ggml_format_name(s, "%s_s_l%d", name_prefix.c_str(), i);
         r_l[i] = r;
         s_l[i] = s;
 
@@ -740,6 +749,168 @@ bool llama_memory_recurrent::is_empty() const {
     return res;
 }
 
+bool llama_memory_recurrent::expand(uint32_t new_mem_size) {
+    return new_mem_size <= size || resize(new_mem_size);
+}
+
+bool llama_memory_recurrent::shrink(uint32_t new_mem_size) {
+    return new_mem_size >= size || resize(new_mem_size);
+}
+
+bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
+    if (new_mem_size == size) {
+        return true;
+    }
+
+    const int32_t n_layer = hparams.n_layer();
+    const uint32_t old_size = size;
+    const uint32_t n_copy = std::min(old_size, new_mem_size);
+
+    struct buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, buft_comparator> ctx_map;
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                // r and s per layer, plus the separate PLE convolution row when present
+                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u) * n_layer * ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                return nullptr;
+            }
+            ctx_map.emplace(buft, ctx);
+            return ctx;
+        }
+        return it->second.get();
+    };
+
+    const std::vector<ggml_tensor *> old_r_l = r_l;
+    const std::vector<ggml_tensor *> old_s_l = s_l;
+    const std::vector<ggml_tensor *> old_p_l = p_l;
+    std::vector<ggml_tensor *> new_r_l(n_layer, nullptr);
+    std::vector<ggml_tensor *> new_s_l(n_layer, nullptr);
+    std::vector<ggml_tensor *> new_p_l(n_layer, nullptr);
+
+    for (int i = 0; i < n_layer; i++) {
+        ggml_tensor * exemplar = old_r_l[i] ? old_r_l[i] : (old_s_l[i] ? old_s_l[i] : old_p_l[i]);
+        if (!exemplar) {
+            continue;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(exemplar->buffer);
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            LLAMA_LOG_ERROR("%s: failed to create ggml context for resized rs cache\n", __func__);
+            return false;
+        }
+
+        const int64_t n_rows = (int64_t) new_mem_size * (1 + n_rs_seq);
+        if (old_r_l[i]) {
+            new_r_l[i] = ggml_new_tensor_2d(ctx, old_r_l[i]->type, old_r_l[i]->ne[0], n_rows);
+            ggml_format_name(new_r_l[i], "%s_r_l%d", name_prefix.c_str(), i);
+        }
+        if (old_s_l[i]) {
+            new_s_l[i] = ggml_new_tensor_2d(ctx, old_s_l[i]->type, old_s_l[i]->ne[0], n_rows);
+            ggml_format_name(new_s_l[i], "%s_s_l%d", name_prefix.c_str(), i);
+        }
+        if (old_p_l[i]) {
+            new_p_l[i] = ggml_new_tensor_2d(ctx, old_p_l[i]->type, old_p_l[i]->ne[0], n_rows);
+            ggml_format_name(new_p_l[i], "%s", old_p_l[i]->name);
+        }
+    }
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> new_ctxs_bufs;
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate resized rs buffer\n", __func__);
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        new_ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (n_copy > 0) {
+        std::vector<uint8_t> tmp;
+        auto copy_planes = [&](const ggml_tensor * src, ggml_tensor * dst) {
+            if (!src || !dst) {
+                return;
+            }
+            const size_t row_size = ggml_row_size(src->type, src->ne[0]);
+            const size_t bytes = row_size * n_copy;
+            tmp.resize(bytes);
+            // Snapshot planes are laid out as [plane][memory cell]. Resizing
+            // changes the plane stride, so copying one contiguous prefix would
+            // silently interleave cells from adjacent rollback planes.
+            for (uint32_t plane = 0; plane <= n_rs_seq; ++plane) {
+                const size_t src_offset = (size_t) plane * old_size * row_size;
+                const size_t dst_offset = (size_t) plane * new_mem_size * row_size;
+                ggml_backend_tensor_get(src, tmp.data(), src_offset, bytes);
+                ggml_backend_tensor_set(dst, tmp.data(), dst_offset, bytes);
+            }
+        };
+        for (int i = 0; i < n_layer; i++) {
+            copy_planes(old_r_l[i], new_r_l[i]);
+            copy_planes(old_s_l[i], new_s_l[i]);
+            copy_planes(old_p_l[i], new_p_l[i]);
+        }
+    }
+
+    r_l = std::move(new_r_l);
+    s_l = std::move(new_s_l);
+    p_l = std::move(new_p_l);
+    ctxs_bufs = std::move(new_ctxs_bufs);
+    cells.resize(new_mem_size);
+    size = new_mem_size;
+
+    uint32_t used_new = 0;
+    for (auto & cell : cells) {
+        cell.tail = -1;
+
+        for (auto it = cell.seq_id.begin(); it != cell.seq_id.end();) {
+            if (*it < 0 || (uint32_t) *it >= size) {
+                LLAMA_LOG_WARN("%s: dropping seq_id %d after resize %u -> %u\n",
+                        __func__, *it, old_size, new_mem_size);
+                it = cell.seq_id.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if (cell.seq_id.empty()) {
+            cell.pos  = -1;
+            cell.src  = -1;
+            cell.src0 = -1;
+            continue;
+        }
+
+        cell.src = -1;
+        cell.src0 = -1;
+
+        ++used_new;
+    }
+
+    used = used_new;
+
+    if (head >= size) {
+        head = 0;
+    }
+    if (n >= size) {
+        n = 0;
+    }
+
+    return true;
+}
+
 size_t llama_memory_recurrent::total_size() const {
     size_t size = 0;
     for (const auto & [_, buf] : ctxs_bufs) {
@@ -934,7 +1105,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         io.write(&r_type_i, sizeof(r_type_i));
 
         // Write row size of R tensor
-        const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+        const uint64_t r_size_row = ggml_row_size(r_l[il]->type, n_embd_r);
         io.write(&r_size_row, sizeof(r_size_row));
 
         // Write each logical cell row range. With pending recurrent rollback,
@@ -967,7 +1138,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             io.write(&s_type_i, sizeof(s_type_i));
 
             // Write row size of S tensor
-            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, n_embd_s);
             io.write(&s_size_row, sizeof(s_size_row));
 
             // Write each logical cell row range. With pending recurrent rollback,
@@ -985,7 +1156,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
 
-            const uint32_t n_embd_s = hparams.n_embd_s();
+            const uint32_t n_embd_s = this->n_embd_s;
 
             // Write S tensor type
             const int32_t s_type_i = (int32_t)s_l[il]->type;
@@ -1148,7 +1319,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         // Read row size of key
         uint64_t r_size_row_ref;
         io.read(&r_size_row_ref, sizeof(r_size_row_ref));
-        const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+        const size_t r_size_row = ggml_row_size(r_l[il]->type, n_embd_r);
         if (r_size_row != r_size_row_ref) {
             LLAMA_LOG_ERROR("%s: mismatched r row size (%zu != %zu, layer %d)\n", __func__, r_size_row, (size_t) r_size_row_ref, il);
             return false;
@@ -1192,7 +1363,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             // Read row size of value
             uint64_t s_size_row_ref;
             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const size_t s_size_row = ggml_row_size(s_l[il]->type, n_embd_s);
             if (s_size_row != s_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
                 return false;
@@ -1209,7 +1380,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             // skip null layers
             if (s_l[il] == nullptr) continue;
 
-            const uint32_t n_embd_s = hparams.n_embd_s();
+            const uint32_t n_embd_s = this->n_embd_s;
 
             // Read type of value
             int32_t s_type_i_ref;

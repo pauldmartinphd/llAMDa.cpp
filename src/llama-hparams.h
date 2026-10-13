@@ -341,6 +341,9 @@ struct llama_hparams {
     uint32_t dsv41_cand_block_size  = 0;
     bool     dsv41_tok_hist         = false; // KV cells keep token ids for the Engram n-gram history
     uint32_t dsv41_hist_len         = 0;     // Engram: predecessor tokens an n-gram hash reads (max_ngram - 1)
+    // true when a DFlash drafter uses a DeepSeek-V4 backbone (MLA + MoE + hyper-connections)
+    // instead of the original dense Qwen3-style backbone.
+    bool dflash_dsv4_backbone = false;
 
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;
@@ -353,16 +356,16 @@ struct llama_hparams {
     uint32_t ple_conv_kernel     = 0;
     uint32_t ple_n_heads         = 0;   // (ngram_size - 1) * heads_per_ngram
     uint32_t ple_head_dim        = 0;
-    uint32_t ple_eos_token_id    = 0;
-    // the id the PLE hash stands in at image positions; 0 makes the loader fall back to EOS
-    uint32_t ple_image_token_id  = 0;
-    // the file lists PLE layer indices, so this is never a per-layer gguf array and can hold one bit per layer
-    std::bitset<LLAMA_MAX_LAYERS> is_ple_impl;
-    // the hash multipliers reach ~2e13 and have to stay 64-bit
-    std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>  ple_layer_multipliers;
-    // head offsets and vocab sizes are token-space indices; the gather truncates them to int32 anyway
-    std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_offsets;
-    std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_vocab_sizes;
+    uint32_t ple_eos_token_id       = 0;
+    // Placeholder the PLE hash sees where an image chunk is spliced in. Keep
+    // key presence separately because token id 0 is valid; when absent, the
+    // loader sets the runtime value to EOS but the saver keeps the key absent.
+    uint32_t ple_image_token_id     = 0;
+    bool     ple_has_image_token_id = false;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> is_ple_impl {};
+    std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>  ple_layer_multipliers {};
+    std::array<uint64_t, LLAMA_MAX_PLE_HEADS>  ple_head_offsets {};
+    std::array<uint64_t, LLAMA_MAX_PLE_HEADS>  ple_head_vocab_sizes {};
 
     bool is_ple(uint32_t il) const;
 

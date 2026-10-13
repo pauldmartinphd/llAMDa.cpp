@@ -83,7 +83,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     hparams.indexer_kpool_select_tail = true;
 
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
-    hparams.is_ple_impl.reset();
+    hparams.is_ple_impl.fill(0);
     hparams.ple_n_heads = 0;
 
     uint32_t n_ple = 0;
@@ -100,7 +100,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
             if (il >= hparams.n_layer_all) {
                 throw std::runtime_error(format("PLE layer %u is out of range", il));
             }
-            hparams.is_ple_impl.set(il);
+            hparams.is_ple_impl[il] = 1;
         }
 
         ml.get_key(LLM_KV_PLE_NGRAM_SIZE,      hparams.ple_ngram_size);
@@ -197,7 +197,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // the head ranges are what the gather indexes, so they set the minimum row count
         int64_t ple_rows = 0;
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
-            ple_rows = std::max(ple_rows, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
+            ple_rows = std::max<int64_t>(ple_rows, hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
         }
 
         // the converter pads the table; a model synthesised from metadata has no tensor to ask
@@ -396,6 +396,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     return cur;
 }
 
+class llm_graph_input_ple_rs : public llm_graph_input_rs {
+public:
+    explicit llm_graph_input_ple_rs(const llama_memory_recurrent_context * mctx) :
+        llm_graph_input_rs(mctx) {}
+
+    bool can_reuse(const llm_graph_params & params) override {
+        if (params.mctx == nullptr) {
+            return false;
+        }
+        const auto * hybrid = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+        const auto * next = hybrid->get_ple();
+        if (next == nullptr || next->get_n_rs() < (uint32_t) params.ubatch.n_seqs) {
+            return false;
+        }
+        mctx = next;
+        return s_copy->ne[0] == next->get_n_rs() &&
+               s_copy_main->ne[0] == params.ubatch.n_seqs &&
+               s_copy_tail->ne[0] == next->get_n_rs() - 1 &&
+               head == next->get_head() && rs_z == next->get_rs_z();
+    }
+};
+
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -415,6 +437,22 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     if (mctx_idx) {
         GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
+    }
+
+    llm_graph_input_rs * inp_ple = nullptr;
+    if (hparams.ple_n_heads > 0) {
+        const auto * mctx_ple = mctx_hyb->get_ple();
+        GGML_ASSERT(mctx_ple != nullptr && mctx_ple->get_n_rs() >= (uint32_t) ubatch.n_seqs);
+
+        auto ple_rs = std::make_unique<llm_graph_input_ple_rs>(mctx_ple);
+        const int64_t n_rs = mctx_ple->get_n_rs();
+        ple_rs->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(ple_rs->s_copy);
+        ple_rs->s_copy_main = ggml_view_1d(ctx0, ple_rs->s_copy, ubatch.n_seqs, 0);
+        ple_rs->s_copy_tail = ggml_view_1d(ctx0, ple_rs->s_copy, n_rs - 1, ple_rs->s_copy->nb[0]);
+        ple_rs->head = mctx_ple->get_head();
+        ple_rs->rs_z = mctx_ple->get_rs_z();
+        inp_ple = static_cast<llm_graph_input_rs *>(res->add_input(std::move(ple_rs)));
     }
 
     ggml_tensor * ple_emb = nullptr;
@@ -450,7 +488,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         res->t_layer_inp[il] = res_hc;
 
         if (hparams.is_ple(il)) {
-            res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
+            res_hc = build_ple(inp_ple, ple_emb, res_hc, il);
         }
 
         ggml_tensor * inject = nullptr;
@@ -1420,7 +1458,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
-    ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
+    ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_r_l(il),
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
             hist, hc_dim, il);
 

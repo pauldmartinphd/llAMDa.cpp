@@ -1468,7 +1468,12 @@ void llm_graph_result::reset() {
     fused_nodes.clear();
     hdmd_inputs.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    // Keep a small metadata margin for large/reused DeepSeek graphs. The
+    // graph node estimate is intentionally conservative, but view/reshape
+    // construction can still require a handful of extra tensor objects.
+    constexpr int64_t meta_margin_objects = 64;
+    buf_compute_meta.resize(ggml_tensor_overhead()*(max_nodes + meta_margin_objects) +
+            ggml_graph_overhead_custom(max_nodes, false));
 
     ggml_init_params params = {
         /*.mem_size   =*/ buf_compute_meta.size(),
@@ -1685,9 +1690,13 @@ ggml_tensor * llm_graph_context::build_hadamard_input(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+                  bool   force_fp32_allreduce) const {
     cur = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    if (force_fp32_allreduce) {
+        res->flags |= GGML_TENSOR_FLAG_FORCE_FP32_ALLREDUCE;
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2560,7 +2569,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    {
+    if (arch == LLM_ARCH_LAGUNA) {
+        // Laguna can produce post-SwiGLU expert activations around 1e6. Backends
+        // that stage MUL_MAT_ID activations or Q8_1 block sums as f16 can overflow
+        // even though the source tensor is finite. Normalize each expert/token
+        // column for the down projection, then restore its magnitude. A power-of-2
+        // target of 8192 also bounds any 32-value block sum below the f16 limit.
+        const float f16_safe = 8192.0f;
+        ggml_tensor * col_sum = ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur));
+        col_sum->flags |= GGML_TENSOR_FLAG_FORCE_FP32_ALLREDUCE;
+        ggml_tensor * col_l2 = ggml_sqrt(ctx0, col_sum);
+        col_l2 = ggml_clamp(ctx0, col_l2, 1e-8f, 1e30f);
+        ggml_tensor * col_scale = ggml_scale(ctx0, col_l2, 1.0f/f16_safe);
+        ggml_tensor * cur_safe = ggml_div(ctx0, cur, col_scale);
+        experts = build_lora_mm_id(down_exps, cur_safe, selected_experts, down_exps_s, slots);
+        // Keep restoration as MUL with a mirrored tensor so tensor-parallel MoE
+        // scheduling can delay its allreduce through routing and expert aggregation.
+        experts = ggml_mul(ctx0, experts, col_scale);
+    } else {
         // TODO: this graph-level rescaling should only be applied when the corresponding backend does not support
         //       ggml_prec_set_src(experts, GGML_PREC_BF16, 1);
         //       ref: https://github.com/ggml-org/llama.cpp/pull/30656#issuecomment-6269597922
@@ -3269,8 +3295,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 }
 
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
-    const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+    return build_attn_inp_kv(static_cast<const llama_kv_cache_context *>(mctx));
+}
 
+llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv(
+        const llama_kv_cache_context * mctx_cur) const {
+    GGML_ASSERT(mctx_cur != nullptr);
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));

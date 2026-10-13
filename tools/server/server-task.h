@@ -84,11 +84,13 @@ struct task_params {
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
 
-    bool timings_per_token   = false;
-    bool post_sampling_probs = false;
+    bool timings_per_token       = false;
+    bool post_sampling_probs     = false;
+    bool backend_sampling_set    = false; // explicitly provided by the request
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
+    int32_t speculative_n_max = -1; // per-request cap; -1 preserves configured speculator defaults
 
     // response formatting
     bool               verbose  = false;
@@ -672,9 +674,12 @@ struct server_prompt {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    // Optional speculative sidecar attention-window snapshot; empty when the
+    // sidecar cannot snapshot (older binaries or a stale sequence).
+    std::vector<uint8_t> spec;
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + spec.size();
     }
 };
 
@@ -692,6 +697,23 @@ struct server_prompt_cache_state {
         return res;
     }
 };
+
+// Returns true when the incoming prompt extends the resident text-only prompt
+// exactly. In this case, saving and restoring the resident state through the
+// host prompt cache is redundant; the state can be reused in place.
+bool server_prompt_cache_can_reuse_in_place(
+        const server_tokens & resident,
+        const server_tokens & incoming,
+        bool cache_prompt);
+
+// Pure policy helper for the recurrent host-cache fast path. An ineligible
+// route, a resident branch that must be preserved, or a better cached state
+// always keeps the established update path.
+bool server_prompt_cache_can_skip_recurrent_update(
+        bool eligible,
+        bool update_required,
+        bool reuse_in_place,
+        bool has_better_cached_prompt);
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
@@ -711,7 +733,19 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    // True when a cached state already contains every token in prompt.
+    bool contains(const server_prompt & prompt) const;
+
+    // Remove an allocated cache state whose serialization did not complete.
+    bool discard(const server_prompt_cache_state * state);
+
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, size_t state_size_spec);
+
+    // Non-destructively checks whether load() would prefer a cached state over
+    // the resident prompt. This allows callers to avoid serializing a resident
+    // state when there is neither a branch to preserve nor a better state to load.
+    bool has_better_match(const server_prompt & prompt, const server_tokens & tokens_new) const;
+    const server_prompt_cache_state * find_better_match(const server_prompt & prompt, const server_tokens & tokens_new) const;
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

@@ -57,7 +57,7 @@ struct llama_cparams {
 
     size_t moe_cache_size;
 
-    std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    std::vector<bool> embeddings_layer_inp; // [n_layer() + 1] extract input embeddings for layer; slot n_layer = output of the final layer
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

@@ -12,6 +12,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "speculative-content.h"
 #include "unicode.h"
 
 #include <algorithm>
@@ -1420,6 +1421,26 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    // Resolve or build an explicitly enabled sidecar bundle before model-load
+    // policy decides whether a shared output head must remain mirrored.
+    (void) common_speculative_sidecar_candidate(
+            params.speculative, params.model.path, (uint32_t) params.n_parallel);
+
+    const char * output_sharding = std::getenv("GGML_TP_SHARDED_OUTPUT");
+    const bool use_vocab_sharded_output = params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+        output_sharding != nullptr && std::strcmp(output_sharding, "1") == 0;
+    if (use_vocab_sharded_output) {
+        if (params.sampling.backend_sampling) {
+            COM_WRN("%s", "backend sampling requested with GGML_TP_SHARDED_OUTPUT=1; using hidden-axis/full-logit output instead of vocabulary sharding\n");
+        }
+        const bool has_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (!params.sampling.backend_sampling && has_mtp && params.speculative.draft.backend_sampling) {
+            COM_WRN("%s", "vocabulary-sharded output disables native MTP backend draft sampling; sidecar-local sampling is unaffected\n");
+            params.speculative.draft.backend_sampling = false;
+        }
+    }
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
@@ -1641,9 +1662,13 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
 }
 
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    seq_rm(seq_id, p0, p1, p0);
+}
+
+void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos p0_dft) const {
     common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
     if (ctx_dft) {
-        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+        common_context_seq_rm(ctx_dft, seq_id, p0_dft, p1);
     }
 }
 
@@ -1690,6 +1715,26 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
+    const bool has_external_shared_head_draft =
+        std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end() ||
+        std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+    // A sidecar-only DFlash/DSpark run never loads the host draft model, so the
+    // shared output head does not need to stay mirrored. The candidate probe is
+    // path/artifact-based and deterministic; if it passes here but the model
+    // preflight later fails, the speculative loader fails closed instead of
+    // loading a head-sharing host draft against a sharded head.
+    const bool sidecar_only_candidate = has_external_shared_head_draft &&
+        common_speculative_sidecar_candidate(params.speculative, params.model.path,
+            (uint32_t) params.n_parallel);
+    mparams.no_tp_output_head_sharding = has_external_shared_head_draft && !sidecar_only_candidate;
+
+    const char * output_sharding = std::getenv("GGML_TP_SHARDED_OUTPUT");
+    mparams.no_tp_output_vocab_sharding = params.sampling.backend_sampling &&
+        params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+        output_sharding != nullptr && std::strcmp(output_sharding, "1") == 0;
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {
@@ -1718,6 +1763,14 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    if (common_speculative_content_candidate_eligible(params.speculative) &&
+            common_speculative_content_env_enabled()) {
+        const uint32_t content_n_max = (uint32_t) std::min<int64_t>(
+                UINT32_MAX,
+                (int64_t) std::max(0, params.speculative.draft.n_max) +
+                    common_speculative_content_env_max_boost());
+        cparams.n_rs_seq = std::max(cparams.n_rs_seq, content_n_max);
+    }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

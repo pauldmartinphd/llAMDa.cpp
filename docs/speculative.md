@@ -74,6 +74,20 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+Laguna DFlash drafters (for example `poolside/Laguna-XS-2.1-DFlash` for
+`poolside/Laguna-XS-2.1`) are supported through the same flow. Their GGUF is marked
+with `dflash.decoder_arch = laguna`, which switches the draft layers to the Laguna
+decoder contract (softplus attention gate, per-aux feature norms, context K/V through
+the input layernorm, causal noise block):
+
+```bash
+python convert_hf_to_gguf.py poolside/Laguna-XS-2.1-DFlash \
+    --target-model-dir poolside/Laguna-XS-2.1 --outtype bf16 --outfile Laguna-XS-2.1-DFlash.gguf
+
+llama-server -m Laguna-XS-2.1.gguf -md Laguna-XS-2.1-DFlash.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 15 -fa on --jinja
+```
+
 See:
 
 - #22105
@@ -103,8 +117,9 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 `--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
 acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
 
-Currently only drafts with a Qwen3 backbone are supported; support for other backbones
-(e.g. Gemma4) is planned.
+Drafts with a Qwen3 backbone and drafts with a DeepSeek-V4 backbone (MLA + MoE +
+hyper-connections, as used by DeepSeek-V4-Flash-DSpark) are supported; support for other
+backbones (e.g. Gemma4) is planned.
 
 DSpark drafts exported in the [speculators](https://github.com/vllm-project/speculators) format
 (for example [`RedHatAI/gemma-4-31B-it-speculator.dspark`](https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.dspark))
@@ -113,6 +128,7 @@ convert the same way.
 See:
 
 - #25173
+- #25683
 
 ### n-gram Cache (`ngram-cache`)
 
@@ -158,6 +174,118 @@ The number of accepted tokens is stored for each used n-gram.
 ```
 llama-server [...] --spec-type ngram-map-k4v --spec-ngram-map-k4v-size-n 8 --spec-ngram-map-k4v-size-m 8 --spec-ngram-map-k4v-min-hits 2 --spec-draft-n-max 64
 ```
+
+#### Sidecar content-aware stacked verification
+
+When a K4V map is stacked ahead of the qualified dense-MTP sidecar, content-aware
+K4V verification is enabled automatically by the exact `SPEC_SIDECAR=1` master
+gate. It can grant K4V a small relative verification-width boost without
+changing the neural provider's configured generation width:
+
+```bash
+SPEC_SIDECAR=1 GGML_TP_SHARDED_OUTPUT=1 \
+  ./llama-server [...] --parallel 1 \
+  --spec-type draft-mtp,ngram-map-k4v --spec-draft-n-max 4
+```
+
+The controller uses one scalar structural-confidence level and permits only
+`base+0` through `base+3` for K4V. Exactly one K4V map and the dense MTP
+sidecar are required. MTP generation remains fixed at the configured baseline
+(currently four); a K4V miss therefore falls back to an ordinary four-token MTP
+cycle. The sixth target-verification row is added only when K4V actually returns
+a fifth proposal. Host/native draft models and stacks without K4V are unchanged.
+
+Runtime selection is limited to the `qwen35-mtp` gfx1030 TP4 tensor-split test
+envelope with vocabulary-sharded output, `--parallel 1`, baseline width four,
+deferred catch-up, and direct target-device rows. DFlash retains its
+user-configured neural/K4V baseline; it is not hard-coded to width four and
+receives no automatic content boost.
+
+The default configuration uses an 8-token window, +1 maximum boost, and
+two-update upward hysteresis. The window accepts 4 through 32 tokens and
+includes the current target-sampled token. Set `SPEC_CONTENT_BOOST=0` (also
+`off` or `false`) to disable stacked verification while leaving the sidecar
+active. The legacy values `1`, `on`, and `true` remain explicit enables.
+`SPEC_CONTENT_MAX_BOOST=0` is an independent opt-out; positive values through 3,
+`SPEC_CONTENT_WINDOW`, and `SPEC_CONTENT_HYST` override the defaults. Values +2
+and +3 remain unqualified experiments. `SPEC_CONTENT_TRACE`,
+`SPEC_CONTENT_PROVISIONAL`, and `SPEC_CONTENT_ADAPT` remain diagnostic/reserved
+switches.
+
+The earlier design widened MTP generation as well as target verification. It
+was rejected: across three 768-token C++, Python, and Rust tasks, equal-workload
+throughput fell 5.54%, and fifth-position neural acceptance did not repay the
+extra neural step plus sixth target row. This POC tests a different economic
+boundary: the neural width never changes, and the extra target row is paid only
+when K4V already has a longer continuation. MTP improved on an intentionally
+repetitive K4V fixture (`120.820 -> 127.608 tok/s`, +5.618%): 31 width-five
+K4V cycles accepted all five proposals and avoided six target cycles. However,
+the realistic prose/C++/Python/Rust set produced no K4V candidate longer than
+four; matched xhigh prose and three-code aggregate results were -0.431% and
+-0.475%, respectively, with identical token hashes and draft counts. DFlash
+was negative even on the repetitive fixture (`106.052 -> 100.769 tok/s`,
+-4.981%) despite complete fifth-position acceptance, so it is explicitly
+excluded. Automatic activation is therefore restricted to the exact MTP+K4V
+sidecar profile; deployments whose workload does not contain useful long K4V
+continuations can retain the prior behavior with `SPEC_CONTENT_BOOST=0`.
+
+The fixed classifier is conservative for the dominant workloads: mostly-prose
+xhigh thinking remains at the baseline, while sustained fenced or unfenced
+source code can select +1. Short inline identifiers, inline JSON, Markdown
+tables, and protocol/control tokens are not positive anchors; realistic
+reasoning math remains at the baseline. Parentheses and arithmetic operators
+receive positive weight only in a local source-code context. Single table
+pipes, Markdown emphasis/separator pieces, hyphenated prose, and punctuation
+such as `?`, `%`, and `~` are excluded from code evidence; `||` remains a code
+operator. Braces and brackets remain local evidence, while URL/path pieces are
+not treated as comments or operators.
+
+Backtick-fenced blocks are a committed mode and inline backticks are a local
+delimiter mode. Closing fences and inline spans are evidence barriers, so
+source tokens still present in the local window cannot re-boost trailing
+explanatory prose.
+Mode state is synchronized only from committed prompt tokens plus the current
+target token; rejected drafts cannot alter it. A replacement request starts
+with `common_speculative_begin()`, which rebuilds mode state even when the new
+prompt has the same length and terminal token. Score levels begin at 4, 10, and
+18.
+
+An explicit request-level `speculative.n_max` bypasses content selection and
+remains the authoritative cap. Runtime sidecar failure, a stale sequence, or
+loss of direct device handoff returns K4V to the fixed neural baseline. A K4V
+proposal of `N` tokens produces `N + 1` target-verification rows because the
+sampled target token is verified with the draft. End-of-request summaries
+bucket actual candidate verification width. Neural fallbacks and K4V results
+no longer than the neural baseline do not invoke or update the classifier;
+when a later long K4V candidate appears, `prepare()` reconstructs exact state
+from committed prompt history. Every emitted proposal still receives complete
+target verification, and stochastic neural proposals still carry one complete
+validated proposal-distribution row per token.
+
+K4V first forms a cheap candidate within the reserved maximum envelope. The
+classifier runs only when that candidate exceeds the fixed neural width, then
+trims it to the content-selected cap before target decoding.
+`SPEC_CONTENT_PROVISIONAL=1` records a provisional score but does not relaunch
+K4V or a neural provider and cannot leave extra uncommitted sidecar KV.
+Only the target-accepted prefix is committed to content state. Adaptive
+weighting is parsed for future work but remains disabled. `SPEC_CONTENT_TRACE=1`
+emits one log line per cycle and is diagnostic only; disable it for timing.
+
+The vocabulary-only visual probe runs the exact classifier without loading
+model weights or launching inference:
+
+```sh
+cmake --build build --target llama-content-classify
+./build/bin/llama-content-classify -m /models/target.gguf
+./build/bin/llama-content-classify -m /models/target.gguf \
+  --windows 8 --detail-window 8 --file /tmp/mixed-sample.txt
+```
+
+It prints each real tokenizer piece, structural flags, score, raw/selected
+level, fenced/inline mode, selected K4V cap, and target-verification row count.
+Built-in samples prioritize chat-shaped xhigh thinking, technical reasoning,
+reasoning-to-code transitions, and fenced/unfenced code. Inline data, tables,
+formulas, URLs, paths, and short inline code remain adversarial controls.
 
 ### n-gram Mod (`ngram-mod`)
 
@@ -210,7 +338,9 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 
 Use `--backend-sampling` to run supported target-model samplers on the model backend. Draft-model sampling uses the backend by default and can be controlled with `--spec-draft-backend-sampling` and `--no-spec-draft-backend-sampling`.
 
-Unsupported samplers and device layouts fall back to CPU sampling. Tensor split mode does not support backend sampling. A fixed seed produces repeatable random draws, but stochastic CPU and backend sampling can still select different tokens because floating-point operations can differ between implementations and devices. Use greedy sampling when exact output matching is required.
+Unsupported samplers and device layouts fall back to CPU sampling. Generic tensor-split backend sampling remains unsupported; the RDNA2 fork has narrow automatic exceptions for its certified four-GPU, large-vocabulary, temperature-zero MTP `n_max=4` and DFlash `n_max=5|7` greedy paths. These single-neural paths are selected automatically by the gfx1030 native profile only when filtering and penalties are neutral, no grammar/reasoning/probability output is requested, and the request did not explicitly set `backend_sampling`. Set `GGML_HIP_GFX1030_TARGET_BACKEND_SAMPLING=0` (or the global `GGML_HIP_RDNA2_AUTO=0`) to disable them. Experimental stacked `ngram-mod` target sampling requires `GGML_HIP_GFX1030_STACKED_TARGET_BACKEND_SAMPLING=1`; experimental stochastic target sampling additionally requires `GGML_HIP_GFX1030_STOCHASTIC_TARGET_BACKEND_SAMPLING=1` and is automatically limited to MTP. DFlash stochastic target sampling was measured slower on the realistic qualification suite and is intentionally not exposed as an automatic mode. A fixed seed produces repeatable random draws, but stochastic CPU and backend sampling can still select different tokens because floating-point operations can differ between implementations and devices. Use greedy sampling when exact output matching is required.
+
+The automatic chain is stateless and remains attached to its slot across compatible requests so the backend can reuse its scheduler reservation. A request that becomes ineligible or explicitly selects a sampler detaches the chain and follows the normal fallback. For the automatic path, `cache_prompt: false` still preserves checkpoint-driven prompt chunk boundaries, but clears older prompt checkpoints and skips serializing an unused replacement. `cache_prompt: true` and all fallback paths retain normal checkpoint behavior; switching from uncached to cached operation requires one full prompt reprocessing pass before checkpoint reuse resumes.
 
 ### Synthetic Acceptance
 
@@ -236,7 +366,7 @@ Use exactly one of these options:
 
 ```
 --spec-draft-model, -md, --model-draft  FNAME
-                                        draft model for speculative decoding (default: unused)
+                                        draft model; SPEC_SIDECAR=1 automatically prepares supported DFlash/Qwen4Exp provider assets (default: unused)
                                         (env: LLAMA_ARG_SPEC_DRAFT_MODEL)
 --spec-draft-hf, -hfd, -hfrd, --hf-repo-draft  <user>/<model>[:quant]
                                         HuggingFace repository for the draft model
@@ -445,6 +575,12 @@ statistics ngram_map_k: #calls(b,g,a) = 6 1690 26, #gen drafts = 26, #acc drafts
 - `#gen tokens`: number of tokens generated by this implementation (including rejected tokens)
 - `#acc tokens`: number of tokens accepted by the main model
 - `dur(b,g,a): durations of begin (new prompt), generation and accumulation (process acceptance).
+
+### Native DFlash2 Q4_0 rows/block=4
+
+The native gfx1030 dispatcher automatically selects the exact Q4_0 M8 rows/block=4 kernel only for the certified standard-Q8_1, non-routed width-eight target shapes. It preserves rows2 arithmetic order and falls back for every unsupported shape or semantic path. Set `GGML_HIP_GFX1030_MMVQ_W8_ROWS4=0` to retain rows2, or `GGML_HIP_RDNA2_AUTO=0` to disable the native profile.
+
+The validated detached and post-promotion runs preserved output/token hashes, draft/accepted counts, prompt-cache behavior, graph-disabled behavior, fallback semantics, and concurrent slots. The locked DFlash2 A/B/B/A was `69.7819 -> 70.8576 tok/s` (`+1.5414%`). This is retained as a small safe incremental gain; it is not presented as a material >=5% optimization.
 
 ## Benchmarking
 

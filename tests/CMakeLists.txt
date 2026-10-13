@@ -194,6 +194,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-component PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp)
+    llama_build_and_test(test-server-prompt-cache.cpp)
+    target_include_directories(test-server-prompt-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-prompt-cache PRIVATE server-context)
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
@@ -312,6 +315,61 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-metal-graph-optimize.cpp LINK ggml ggml-metal)
     target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
 endif()
+llama_build_and_test(test-spec-sidecar-artifact.cpp)
+llama_build_and_test(test-speculative-sidecar-cap.cpp)
+target_include_directories(test-speculative-sidecar-cap PRIVATE ${PROJECT_SOURCE_DIR}/common)
+
+llama_build_and_test(test-speculative-content.cpp)
+target_include_directories(test-speculative-content PRIVATE ${PROJECT_SOURCE_DIR}/common)
+
+llama_build_and_test(test-speculative-dflash-controller.cpp)
+target_include_directories(test-speculative-dflash-controller PRIVATE ${PROJECT_SOURCE_DIR}/common)
+target_include_directories(test-spec-sidecar-artifact PRIVATE ${PROJECT_SOURCE_DIR}/src/spec_sidecar)
+
+# Pure host-side selector contract for the guarded RDNA2 BF16 hidden AllReduce.
+llama_build_and_test(test-cuda-allreduce-precision.cpp)
+target_include_directories(test-cuda-allreduce-precision PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+
+# Topology/rank policy contract for the packaged RCCL tuner.
+llama_build_and_test(test-rdna2-rccl-policy.cpp)
+target_include_directories(test-rdna2-rccl-policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-hip)
+
+# Pure host-side parser and dispatch contract for the RDNA2 P2P host-snapshot path.
+llama_build_and_test(test-rdna2-p2p-policy.cpp)
+target_include_directories(test-rdna2-p2p-policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cuda)
+
+# Pure host-side parser contract for the opt-in native gfx1100 runtime umbrella.
+llama_build_and_test(test-rdna3-auto-policy.cpp)
+target_include_directories(test-rdna3-auto-policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cuda)
+
+# Pure host-side selector contract for the bounded gfx1030 routed MMVQ six-row path.
+llama_build_and_test(test-mmvq-batch6-config.cpp)
+target_include_directories(test-mmvq-batch6-config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cuda)
+
+llama_build_and_test(test-mmvq-rdna2-config.cpp)
+target_include_directories(test-mmvq-rdna2-config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cuda)
+
+# Pure host-side model/backend selector contract for automatic Qwen3.5 routed Q4_K MMQ J16.
+llama_build_and_test(test-qwen35moe-mmq-config.cpp)
+target_include_directories(test-qwen35moe-mmq-config PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/models
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src/ggml-cuda)
+
+# Synthetic graph-level benchmarks for gfx1030/RDNA2 kernel tuning.
+# They are manual benchmarks rather than CTests because timing is device-dependent.
+if (GGML_HIP)
+    llama_build(test-mmvq-rdna2.cpp)
+    llama_build(test-mmid-rdna2.cpp)
+    llama_build(test-hc-mixes-rdna2.cpp)
+    llama_build(test-lightning-indexer-rdna2.cpp)
+endif()
+
+llama_build_and_test(test-tensor-split.cpp)
+llama_build_and_test(test-meta-split.cpp)
+target_include_directories(test-tensor-split PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
+llama_build_and_test(test-tp-output-policy.cpp)
+target_include_directories(test-tp-output-policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
@@ -319,6 +377,19 @@ llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
+
+# Pure host-side policy contract for the automatic gfx1030 speculative target
+# backend-sampling profile, including the ngram-mod proposal cascade.
+llama_build_and_test(test-speculative-backend-policy.cpp)
+target_include_directories(test-speculative-backend-policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../tools/server)
+
+# Manual model-dependent gate for benchmark prefix-state reuse. This is not a
+# CTest because representative DSV4 depths require the external production GGUF.
+llama_build(test-state-restore-equivalence.cpp)
+
+# Manual short model-dependent A/B gate for the guarded DSV4 BF16 hidden
+# AllReduce. It captures raw full-vocabulary logits and uses an external GGUF.
+llama_build(test-dsv4-bf16-allreduce-equivalence.cpp)
 
 if (APPLE)
     llama_build(test-rset-release.cpp)

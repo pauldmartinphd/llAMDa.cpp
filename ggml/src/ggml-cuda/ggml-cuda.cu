@@ -3,7 +3,9 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/comm-precision.h"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/rdna2-p2p-allreduce-policy.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -78,6 +80,7 @@
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
@@ -86,13 +89,138 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
+#include <sstream>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
+#if defined(GGML_USE_HIP) && defined(__linux__)
+#include <dlfcn.h>
+#include <filesystem>
+#endif
+
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+#if defined(GGML_USE_HIP)
+static bool ggml_cuda_rdna2_is_four_v620_pcie_hop2(int physical_device_count) {
+    if (physical_device_count != 4) {
+        return false;
+    }
+    for (int device = 0; device < physical_device_count; ++device) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, device) != cudaSuccess ||
+                std::strncmp(prop.name, "AMD Radeon Pro V620", 20) != 0 ||
+                std::strncmp(prop.gcnArchName, "gfx1030", 7) != 0) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+    for (int src = 0; src < physical_device_count; ++src) {
+        for (int dst = 0; dst < physical_device_count; ++dst) {
+            if (src == dst) {
+                continue;
+            }
+            int can_access = 0;
+            unsigned link_type = 0;
+            unsigned hop_count = 0;
+            if (cudaDeviceCanAccessPeer(&can_access, src, dst) != cudaSuccess || !can_access ||
+                    hipExtGetLinkTypeAndHopCount(src, dst, &link_type, &hop_count) != hipSuccess ||
+                    link_type != 2 || hop_count != 2) {
+                (void) cudaGetLastError();
+                return false;
+            }
+        }
+    }
+    return true;
+}
+#endif
+
+#if defined(GGML_USE_HIP) && defined(__linux__)
+static bool ggml_cuda_rdna3_auto_active = false;
+
+static bool ggml_cuda_rdna3_auto_qualified_topology(const ggml_cuda_device_info & info) {
+    if (!ggml_cuda_rdna3_auto_counts_qualified(info.physical_device_count, info.device_count)) {
+        return false;
+    }
+
+    const int device_count = info.physical_device_count;
+    for (int device = 0; device < device_count; ++device) {
+        if (info.devices[device].physical_device != device ||
+                info.devices[device].cc != GGML_CUDA_CC_RDNA3) {
+            return false;
+        }
+
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, device) != cudaSuccess ||
+                std::strcmp(prop.name, "AMD Radeon RX 7900 XT") != 0 ||
+                std::strcmp(prop.gcnArchName, "gfx1100") != 0) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+
+    // Require a fully peer-accessible set before installing the P2P default.
+    // RCCL remains available without this profile on partial-peer topologies.
+    for (int src = 0; src < device_count; ++src) {
+        for (int dst = 0; dst < device_count; ++dst) {
+            if (src == dst) {
+                continue;
+            }
+            int can_access = 0;
+            if (cudaDeviceCanAccessPeer(&can_access, src, dst) != cudaSuccess || !can_access) {
+                (void) cudaGetLastError();
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ggml_cuda_rdna3_auto_apply(const ggml_cuda_device_info & info) {
+    const char * value = std::getenv("GGML_HIP_RDNA3_AUTO");
+    const auto flag = ggml_cuda_rdna3_auto_parse(value);
+    if (flag == ggml_cuda_rdna3_auto_flag::invalid) {
+        GGML_LOG_WARN("GGML_HIP_RDNA3_AUTO=\"%s\" is not recognized; disabling the RDNA3 Auto profile\n",
+                value == nullptr ? "<unset>" : value);
+        return false;
+    }
+    if (flag != ggml_cuda_rdna3_auto_flag::enabled) {
+        return false;
+    }
+    if (!ggml_cuda_rdna3_auto_qualified_topology(info)) {
+        GGML_LOG_INFO("native RDNA3 Auto: no qualified native gfx1100 multi-GPU topology; leaving runtime policy unchanged\n");
+        return false;
+    }
+
+#ifndef GGML_USE_NCCL
+    GGML_LOG_WARN("native RDNA3 Auto: RCCL is not compiled in; rebuild with GGML_HIP_RCCL=ON\n");
+    return false;
+#else
+    auto set_default = [](const char * name, const char * default_value) {
+        if (std::getenv(name) != nullptr) {
+            return;
+        }
+        if (setenv(name, default_value, 1) != 0) {
+            GGML_LOG_WARN("native RDNA3 Auto: failed to set default %s=%s\n", name, default_value);
+        }
+    };
+
+    // These defaults are the safe, tested collective/P2P umbrella. Do not
+    // force P2P distance, algorithm, protocol, or channel counts: RCCL Auto
+    // selected direct P2P on this topology and owns those decisions.
+    set_default("GGML_CUDA_ALLREDUCE", "nccl");
+    set_default("GGML_CUDA_P2P", "1");
+    set_default("NCCL_P2P_DISABLE", "0");
+    GGML_LOG_INFO("native RDNA3 Auto: RCCL/direct-P2P defaults enabled; preserving user overrides and leaving NCCL level/algorithm/protocol on Auto\n");
+    return true;
+#endif
+}
+#endif
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -424,10 +552,21 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.default_tensor_split[id] /= total_vram;
     }
 
+    bool rdna3_auto_active = false;
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    rdna3_auto_active = ggml_cuda_rdna3_auto_apply(info);
+    ggml_cuda_rdna3_auto_active = rdna3_auto_active;
+#endif
+
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
 
-    if (ggml_cuda_p2p_enabled()) {
+    bool enable_peer_access = ggml_cuda_p2p_enabled() || rdna3_auto_active;
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    enable_peer_access = enable_peer_access ||
+        ggml_cuda_rdna2_is_four_v620_pcie_hop2(info.physical_device_count);
+#endif
+    if (enable_peer_access) {
         for (int id = 0; id < info.physical_device_count; ++id) {
             CUDA_CHECK(cudaSetDevice(id));
             for (int id_other = 0; id_other < info.physical_device_count; ++id_other) {
@@ -1026,6 +1165,326 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 // (NCCL communicators or the internal AllReduce pipeline) are initialised
 // eagerly during comm_init so any init failure surfaces at startup rather
 // than mid-run.
+static constexpr size_t GGML_CUDA_RDNA2_P2P_SNAPSHOT_STRIDE = 30720;
+static constexpr unsigned GGML_CUDA_RDNA2_P2P_FLAG_STRIDE = 32;
+// Dispatch requires the same stream index on every rank. Reaching the next
+// exact-generation start barrier therefore proves that each peer completed
+// the preceding kernel; eight slots additionally bound ordinary launch skew.
+static constexpr size_t GGML_CUDA_RDNA2_P2P_SNAPSHOT_SLOTS = 8;
+
+static int ggml_cuda_rdna2_p2p_host_allreduce_mode() {
+    static const int mode = []() {
+        const char * value = std::getenv("GGML_HIP_GFX1030_P2P_ALLREDUCE");
+        const auto result = ggml_cuda_rdna2_p2p_host_parse_mode(
+            ggml_cuda_rdna2_auto_enabled(), value);
+        if (!result.recognized) {
+            GGML_LOG_WARN("GGML_HIP_GFX1030_P2P_ALLREDUCE='%s' is not recognized; disabling "
+                    "the host-snapshot AllReduce. Valid: auto, auto-expanded, auto-basic, host, "
+                    "host-fused, host-mtp, 1/on/true/yes, 0/off/false/no\n", value);
+        }
+        return result.mode;
+    }();
+    return mode;
+}
+
+static bool ggml_cuda_rdna2_p2p_host_allreduce_enabled() {
+    return ggml_cuda_rdna2_p2p_host_allreduce_mode() != GGML_CUDA_RDNA2_P2P_HOST_OFF;
+}
+
+static bool ggml_cuda_rdna2_p2p_host_allreduce_mtp_enabled() {
+    const int mode = ggml_cuda_rdna2_p2p_host_allreduce_mode();
+    return mode == GGML_CUDA_RDNA2_P2P_HOST_MTP || mode == GGML_CUDA_RDNA2_P2P_HOST_AUTO ||
+        mode == GGML_CUDA_RDNA2_P2P_HOST_AUTO_EXPANDED;
+}
+
+static uint32_t ggml_cuda_p2p_next_token(uint32_t & serial_state) {
+    return ggml_cuda_p2p_next_nonzero_token(serial_state);
+}
+
+static __device__ __forceinline__ void ggml_cuda_rdna2_p2p_host_barrier4(
+        int rank, unsigned * local_flags, uint32_t token, bool publish_thread_writes) {
+    // Every writer fences before thread zero publishes this block's exact
+    // generation. A future token must never satisfy an older snapshot read.
+    if (publish_thread_writes) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+#if defined(GGML_USE_HIP)
+        __hip_atomic_store(local_flags + rank * GGML_CUDA_RDNA2_P2P_FLAG_STRIDE,
+                token, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        for (int peer = 0; peer < 4; ++peer) {
+            const unsigned * peer_flag =
+                local_flags + peer * GGML_CUDA_RDNA2_P2P_FLAG_STRIDE;
+            while (__hip_atomic_load(peer_flag, __ATOMIC_ACQUIRE,
+                        __HIP_MEMORY_SCOPE_SYSTEM) != token) {
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+#else
+        // This guarded path is HIP-only at runtime; retain CUDA compilation.
+        volatile unsigned * flags = local_flags;
+        flags[rank * GGML_CUDA_RDNA2_P2P_FLAG_STRIDE] = token;
+        __threadfence_system();
+        for (int peer = 0; peer < 4; ++peer) {
+            while (flags[peer * GGML_CUDA_RDNA2_P2P_FLAG_STRIDE] != token) {
+            }
+        }
+        __threadfence_system();
+#endif
+    }
+    __syncthreads();
+}
+
+static __device__ __forceinline__ float4 ggml_cuda_rdna2_p2p_reduce_vec4_exact(
+        int vi, const float * p0, const float * p1, const float * p2, const float * p3) {
+    const float * p[4] = { p0, p1, p2, p3 };
+    // Four FP32 values per vector and 160 vectors per 640-element RCCL chunk.
+    const int c = (vi / 160) & 3;
+    const int o0 = (c + 1) & 3;
+    const int o1 = (c + 2) & 3;
+    const int o2 = (c + 3) & 3;
+    const int o3 = c;
+    const float4 a0 = reinterpret_cast<const float4 *>(p[o0])[vi];
+    const float4 a1 = reinterpret_cast<const float4 *>(p[o1])[vi];
+    const float4 a2 = reinterpret_cast<const float4 *>(p[o2])[vi];
+    const float4 a3 = reinterpret_cast<const float4 *>(p[o3])[vi];
+    float4 sum;
+    sum.x = a0.x; sum.x += a1.x; sum.x += a2.x; sum.x += a3.x;
+    sum.y = a0.y; sum.y += a1.y; sum.y += a2.y; sum.y += a3.y;
+    sum.z = a0.z; sum.z += a1.z; sum.z += a2.z; sum.z += a3.z;
+    sum.w = a0.w; sum.w += a1.w; sum.w += a2.w; sum.w += a3.w;
+    return sum;
+}
+
+static __device__ __forceinline__ float4 ggml_cuda_rdna2_p2p_reduce_vec4_mtp5_exact(
+        int vi, const float * p0, const float * p1, const float * p2, const float * p3) {
+    const float * p[4] = { p0, p1, p2, p3 };
+    // Build-matched RCCL 2.30.4 Auto schedule for 25,600 FP32 elements:
+    // channel 0 has four 3,584-element chunks; channel 1 has four 2,816-element chunks.
+    const int c = vi < 3584 ? vi / 896 : 4 + (vi - 3584) / 704;
+    const int o0 = (c + 1) & 3;
+    const int o1 = (c + 2) & 3;
+    const int o2 = (c + 3) & 3;
+    const int o3 = c & 3;
+    const float4 a0 = reinterpret_cast<const float4 *>(p[o0])[vi];
+    const float4 a1 = reinterpret_cast<const float4 *>(p[o1])[vi];
+    const float4 a2 = reinterpret_cast<const float4 *>(p[o2])[vi];
+    const float4 a3 = reinterpret_cast<const float4 *>(p[o3])[vi];
+    float4 sum;
+    sum.x = a0.x; sum.x += a1.x; sum.x += a2.x; sum.x += a3.x;
+    sum.y = a0.y; sum.y += a1.y; sum.y += a2.y; sum.y += a3.y;
+    sum.z = a0.z; sum.z += a1.z; sum.z += a2.z; sum.z += a3.z;
+    sum.w = a0.w; sum.w += a1.w; sum.w += a2.w; sum.w += a3.w;
+    return sum;
+}
+
+static __global__ void ggml_cuda_rdna2_p2p_host_snapshot_reduce_mtp5_25600(
+        float * dst, float * snapshot,
+        const float * p0, const float * p1, const float * p2, const float * p3,
+        int rank, unsigned * flags, uint32_t token) {
+    const int tid = int(threadIdx.x);
+    float4 * snapshot4 = reinterpret_cast<float4 *>(snapshot);
+    const float4 * dst4_in = reinterpret_cast<const float4 *>(dst);
+    for (int vi = tid; vi < 6400; vi += int(blockDim.x)) {
+        snapshot4[vi] = dst4_in[vi];
+    }
+    ggml_cuda_rdna2_p2p_host_barrier4(rank, flags, token, true);
+    float4 * dst4 = reinterpret_cast<float4 *>(dst);
+    for (int vi = tid; vi < 6400; vi += int(blockDim.x)) {
+        dst4[vi] = ggml_cuda_rdna2_p2p_reduce_vec4_mtp5_exact(vi, p0, p1, p2, p3);
+    }
+}
+
+static __device__ __forceinline__ float4 ggml_cuda_rdna2_p2p_reduce_vec4_dflash6_exact(
+        int vi, const float * p0, const float * p1, const float * p2, const float * p3) {
+    const float * p[4] = { p0, p1, p2, p3 };
+    // Installed RCCL Auto schedule for 30,720 FP32 elements: four 4,096-element
+    // chunks followed by four 3,584-element chunks.
+    const int c = vi < 4096 ? vi / 1024 : 4 + (vi - 4096) / 896;
+    const int o0 = (c + 1) & 3;
+    const int o1 = (c + 2) & 3;
+    const int o2 = (c + 3) & 3;
+    const int o3 = c & 3;
+    const float4 a0 = reinterpret_cast<const float4 *>(p[o0])[vi];
+    const float4 a1 = reinterpret_cast<const float4 *>(p[o1])[vi];
+    const float4 a2 = reinterpret_cast<const float4 *>(p[o2])[vi];
+    const float4 a3 = reinterpret_cast<const float4 *>(p[o3])[vi];
+    float4 sum;
+    sum.x = a0.x; sum.x += a1.x; sum.x += a2.x; sum.x += a3.x;
+    sum.y = a0.y; sum.y += a1.y; sum.y += a2.y; sum.y += a3.y;
+    sum.z = a0.z; sum.z += a1.z; sum.z += a2.z; sum.z += a3.z;
+    sum.w = a0.w; sum.w += a1.w; sum.w += a2.w; sum.w += a3.w;
+    return sum;
+}
+
+static __global__ void ggml_cuda_rdna2_p2p_host_snapshot_reduce_dflash6_30720(
+        float * dst, float * snapshot,
+        const float * p0, const float * p1, const float * p2, const float * p3,
+        int rank, unsigned * flags, uint32_t token) {
+    const int tid = int(threadIdx.x);
+    float4 * snapshot4 = reinterpret_cast<float4 *>(snapshot);
+    const float4 * dst4_in = reinterpret_cast<const float4 *>(dst);
+    for (int vi = tid; vi < 7680; vi += int(blockDim.x)) {
+        snapshot4[vi] = dst4_in[vi];
+    }
+    ggml_cuda_rdna2_p2p_host_barrier4(rank, flags, token, true);
+    float4 * dst4 = reinterpret_cast<float4 *>(dst);
+    for (int vi = tid; vi < 7680; vi += int(blockDim.x)) {
+        dst4[vi] = ggml_cuda_rdna2_p2p_reduce_vec4_dflash6_exact(vi, p0, p1, p2, p3);
+    }
+}
+
+static __global__ void ggml_cuda_rdna2_p2p_host_snapshot_reduce_2560(
+        float * dst, float * snapshot,
+        const float * p0, const float * p1, const float * p2, const float * p3,
+        int rank, unsigned * flags, uint32_t token) {
+    const int tid = int(threadIdx.x);
+    float4 * snapshot4 = reinterpret_cast<float4 *>(snapshot);
+    const float4 * dst4_in = reinterpret_cast<const float4 *>(dst);
+    if (tid < 640) {
+        snapshot4[tid] = dst4_in[tid];
+    }
+    ggml_cuda_rdna2_p2p_host_barrier4(rank, flags, token, true);
+
+    if (tid < 640) {
+        reinterpret_cast<float4 *>(dst)[tid] =
+            ggml_cuda_rdna2_p2p_reduce_vec4_exact(tid, p0, p1, p2, p3);
+    }
+}
+
+static __global__ void ggml_cuda_rdna2_p2p_host_snapshot_reduce_5120(
+        float * dst, float * snapshot,
+        const float * p0, const float * p1, const float * p2, const float * p3,
+        int rank, unsigned * flags, uint32_t token) {
+    const int tid = int(threadIdx.x);
+    float4 * snapshot4 = reinterpret_cast<float4 *>(snapshot);
+    const float4 * dst4_in = reinterpret_cast<const float4 *>(dst);
+    snapshot4[tid] = dst4_in[tid];
+    if (tid < 256) {
+        snapshot4[1024 + tid] = dst4_in[1024 + tid];
+    }
+    ggml_cuda_rdna2_p2p_host_barrier4(rank, flags, token, true);
+
+    float4 * dst4 = reinterpret_cast<float4 *>(dst);
+    dst4[tid] = ggml_cuda_rdna2_p2p_reduce_vec4_exact(tid, p0, p1, p2, p3);
+    if (tid < 256) {
+        dst4[1024 + tid] = ggml_cuda_rdna2_p2p_reduce_vec4_exact(1024 + tid, p0, p1, p2, p3);
+    }
+}
+
+static __global__ void ggml_cuda_rdna2_p2p_host_snapshot_reduce_add_rms_mul_5120(
+        float * reduced_dst, float * snapshot, const float * p0, const float * p1,
+        const float * p2, const float * p3, const float * residual, float * add_dst,
+        const float * weight, float * norm_mul_dst, float eps, int rank,
+        unsigned * flags, uint32_t token) {
+    const int tid = int(threadIdx.x);
+    float4 * snapshot4 = reinterpret_cast<float4 *>(snapshot);
+    const float4 * reduced4_in = reinterpret_cast<const float4 *>(reduced_dst);
+    snapshot4[tid] = reduced4_in[tid];
+    if (tid < 256) {
+        snapshot4[1024 + tid] = reduced4_in[1024 + tid];
+    }
+    ggml_cuda_rdna2_p2p_host_barrier4(rank, flags, token, true);
+
+    // Preserve the ordinary AllReduce F32 materialization boundary.
+    float4 * reduced4 = reinterpret_cast<float4 *>(reduced_dst);
+    reduced4[tid] = ggml_cuda_rdna2_p2p_reduce_vec4_exact(tid, p0, p1, p2, p3);
+    if (tid < 256) {
+        reduced4[1024 + tid] = ggml_cuda_rdna2_p2p_reduce_vec4_exact(1024 + tid, p0, p1, p2, p3);
+    }
+    __syncthreads();
+
+    // Match add_rms_norm_mul_f32<1024>: same per-thread columns, add store
+    // boundary, square accumulation, block reduction, and final multiply.
+    float tmp = 0.0f;
+    for (int col = tid; col < 5120; col += 1024) {
+        float value = reduced_dst[col] + residual[col];
+#if defined(GGML_USE_HIP)
+        asm volatile("" : "+v"(value));
+#else
+        asm volatile("" : "+f"(value));
+#endif
+        add_dst[col] = value;
+        tmp += value * value;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, 1024>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / 5120.0f + eps);
+    __syncthreads();
+    for (int col = tid; col < 5120; col += 1024) {
+        norm_mul_dst[col] = scale * add_dst[col] * weight[col];
+    }
+}
+
+#if defined(GGML_USE_HIP) && defined(__linux__)
+// Experimental two-rank native RDNA2/RDNA3 path. It is deliberately
+// separate from the four-rank RDNA2 host-snapshot implementation above.
+// Direct peer pointers were not accepted as a production data path on the
+// model allocation layout, so this candidate uses portable mapped-host
+// snapshots and exact phase flags. Qualified RDNA2 Auto topologies may arm
+// the original one-block form for width-one decode only; RDNA3 Auto leaves
+// this candidate off. Wider and chunked forms remain explicit-only after
+// matched gfx1100 testing found the first four-block version slightly slower
+// end to end. RCCL remains the fallback for every rejected shape or setup failure.
+static constexpr unsigned GGML_CUDA_RDNA3_P2P_FLAG_STRIDE = 32;
+static constexpr unsigned GGML_CUDA_RDNA3_P2P_END_FLAG_OFFSET = 16;
+static constexpr unsigned GGML_CUDA_RDNA3_P2P_MAX_BLOCKS = 2;
+static constexpr size_t GGML_CUDA_RDNA3_P2P_MAX_ELEMENTS = 5120 * 6;
+static constexpr size_t GGML_CUDA_RDNA3_P2P_SNAPSHOT_SLOTS = 8;
+
+static_assert(GGML_CUDA_RDNA3_P2P_END_FLAG_OFFSET + GGML_CUDA_RDNA3_P2P_MAX_BLOCKS <=
+        GGML_CUDA_RDNA3_P2P_FLAG_STRIDE,
+        "RDNA3 P2P chunk flags must fit inside one rank's flag stride");
+
+static __device__ __forceinline__ void ggml_cuda_rdna3_p2p_barrier2(
+        unsigned * local_flag, const unsigned * peer_flag, uint32_t token) {
+    // The fence must precede the release publication. Equality is deliberate:
+    // accepting a future token could pair this read with the wrong snapshot.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        __hip_atomic_store(local_flag, token, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        while (__hip_atomic_load(peer_flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != token) {
+#if defined(__HIP_PLATFORM_AMD__)
+            __builtin_amdgcn_s_sleep(1);
+#endif
+        }
+    }
+    __syncthreads();
+}
+
+static __global__ __launch_bounds__(1024, 1) void ggml_cuda_rdna3_p2p_host_reduce(
+        float * dst, const float * local, volatile float * snapshot,
+        const volatile float * peer_snapshot, int ne,
+        unsigned * start_local_flags, const unsigned * start_peer_flags,
+        unsigned * end_local_flags, const unsigned * end_peer_flags,
+        uint32_t start_token, uint32_t end_token) {
+    const int block = int(blockIdx.x);
+    const int nblocks = int(gridDim.x);
+    const int chunk = (ne + nblocks - 1) / nblocks;
+    const int start = block * chunk;
+    const int end = min(ne, start + chunk);
+    for (int i = start + int(threadIdx.x); i < end; i += int(blockDim.x)) {
+        snapshot[i] = local[i];
+    }
+    // Every writer fences before the block-wide barrier; thread zero then
+    // publishes the block's start token with a system-scope release store.
+    __threadfence_system();
+    ggml_cuda_rdna3_p2p_barrier2(
+            start_local_flags + block, start_peer_flags + block, start_token);
+    for (int i = start + int(threadIdx.x); i < end; i += int(blockDim.x)) {
+        dst[i] = snapshot[i] + peer_snapshot[i];
+    }
+    // Do not reuse this parity slot until both ranks have completed all reads
+    // in this block. The end flags occupy a disjoint range from start flags.
+    ggml_cuda_rdna3_p2p_barrier2(
+            end_local_flags + GGML_CUDA_RDNA3_P2P_END_FLAG_OFFSET + block,
+            end_peer_flags + GGML_CUDA_RDNA3_P2P_END_FLAG_OFFSET + block, end_token);
+}
+
+#endif
+
 struct ggml_backend_cuda_comm_context {
     using try_allreduce_fn = bool(*)(ggml_backend_cuda_comm_context *, struct ggml_tensor **);
 
@@ -1041,11 +1500,95 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
+    bool rdna2_bf16_hidden_enabled     = false;
+    bool rdna2_bf16_hidden_topology    = false;
+    bool rdna2_bf16_hidden_logged      = false;
+    bool rdna2_bf16_hidden_miss_logged = false;
+
+    std::string                        rdna2_bf16_hidden_audit_path;
+    uint64_t                           audit_context_id = 0;
+    ggml_cuda_allreduce_audit_counters audit;
+    uint64_t audit_ne4096_calls            = 0;
+    uint64_t audit_ne4096_all_f32_calls    = 0;
+    uint64_t audit_ne4096_same_shape_calls = 0;
+    int64_t  audit_first_ne4096_shape[4]   = { 0, 0, 0, 0 };
+    bool     audit_first_ne4096_recorded   = false;
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
+    unsigned * p2p_host_flags_host = nullptr;
+    std::array<unsigned *, 4> p2p_host_flags_dev = {};
+    float * p2p_host_snapshots_host = nullptr;
+    std::array<float *, 4> p2p_host_snapshots_dev = {};
+    std::mutex p2p_host_launch_mutex;
+    uint32_t p2p_host_token = 0;
+    uint64_t p2p_host_calls = 0;
+    bool p2p_host_initialized = false;
+    bool p2p_host_exact_2560 = false;
+    bool p2p_host_exact_5120 = false;
+    bool p2p_host_exact_25600 = false;
+    bool p2p_host_exact_30720 = false;
+    bool p2p_host_logged_2560 = false;
+    // Bitmasks of batch widths already logged, so a run shows every width the
+    // path served or refused without duplicate messages from the fused route.
+    uint32_t p2p_host_logged_widths = 0;
+    uint32_t p2p_host_refused_widths = 0;
+
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    // Opt-in two-rank RDNA2/RDNA3 host-snapshot reduction resources. These
+    // are independent from the guarded four-rank RDNA2 resources.
+    float * rdna3_p2p_snapshots_host = nullptr;
+    // Mapped host pointers are device-local on some HIP platforms. Keep one
+    // view per rank instead of assuming that the device-0 view is valid on
+    // the peer device.
+    std::array<float *, 2> rdna3_p2p_snapshots_dev = {};
+    unsigned * rdna3_p2p_flags_host = nullptr;
+    std::array<unsigned *, 2> rdna3_p2p_flags_dev = {};
+    std::mutex rdna3_p2p_launch_mutex;
+    uint32_t rdna3_p2p_token = 0;
+    uint64_t rdna3_p2p_calls = 0;
+    bool rdna3_p2p_initialized = false;
+    bool rdna3_p2p_chunked = false;
+    uint32_t rdna3_p2p_logged_widths = 0;
+    uint32_t rdna3_p2p_exact_widths = 0;
+#endif
+
+    bool native_rccl_policy_active = false;
+    bool native_rccl_plugin_owned = false;
+    bool native_rccl_mode_owned = false;
+    bool native_rccl_p2p_level_owned = false;
+
+    void write_rdna2_bf16_hidden_audit() const;
+
     ~ggml_backend_cuda_comm_context() {
+        write_rdna2_bf16_hidden_audit();
+        if (p2p_host_initialized) {
+            for (size_t i = 0; i < backends.size(); ++i) {
+                auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                ggml_cuda_set_device(ctx->device);
+                CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+            }
+            std::fprintf(stderr, "RDNA2 P2P rotating host-snapshot AllReduce calls: %" PRIu64 "\n", p2p_host_calls);
+#ifdef GGML_USE_HIP
+            CUDA_CHECK(hipHostFree(p2p_host_snapshots_host));
+            CUDA_CHECK(hipHostFree(p2p_host_flags_host));
+#endif
+        }
+#if defined(GGML_USE_HIP) && defined(__linux__)
+        if (rdna3_p2p_initialized) {
+            for (size_t i = 0; i < backends.size(); ++i) {
+                auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                ggml_cuda_set_device(ctx->device);
+                CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+            }
+            std::fprintf(stderr, "two-rank native P2P host-snapshot AllReduce calls: %" PRIu64 "\n", rdna3_p2p_calls);
+            ggml_cuda_set_device(dev_ids[0]);
+            CUDA_CHECK(hipHostFree(rdna3_p2p_snapshots_host));
+            CUDA_CHECK(hipHostFree(rdna3_p2p_flags_host));
+        }
+#endif
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -1055,12 +1598,990 @@ struct ggml_backend_cuda_comm_context {
     }
 };
 
+#if defined(GGML_USE_HIP) && defined(__linux__) && defined(GGML_USE_NCCL)
+static bool ggml_cuda_rdna3_p2p_flag_enabled(const char * name, const char * legacy_name = nullptr) {
+    const char * value = std::getenv(name);
+    if (value == nullptr && legacy_name != nullptr) {
+        value = std::getenv(legacy_name);
+    }
+    const auto flag = ggml_cuda_rdna3_auto_parse(value);
+    if (flag == ggml_cuda_rdna3_auto_flag::invalid) {
+        GGML_LOG_WARN("%s=\"%s\" is not recognized; disabling the experimental two-rank native P2P path\n",
+                name, value == nullptr ? "<unset>" : value);
+        return false;
+    }
+    return flag == ggml_cuda_rdna3_auto_flag::enabled;
+}
+
+// The generic names are shared by the RDNA2 and RDNA3 ports. Keep the old
+// RDNA3 name as an alias so the earlier supervised experiment remains usable.
+static bool ggml_cuda_rdna3_p2p_explicitly_set() {
+    return std::getenv("GGML_HIP_P2P_ALLREDUCE") != nullptr ||
+        std::getenv("GGML_HIP_RDNA3_P2P_ALLREDUCE") != nullptr;
+}
+
+static bool ggml_cuda_rdna3_p2p_explicitly_enabled() {
+    return ggml_cuda_rdna3_p2p_flag_enabled("GGML_HIP_P2P_ALLREDUCE", "GGML_HIP_RDNA3_P2P_ALLREDUCE");
+}
+
+static bool ggml_cuda_rdna3_p2p_ordinary_requested() {
+    return !ggml_cuda_rdna3_p2p_explicitly_set() ||
+        ggml_cuda_rdna3_p2p_explicitly_enabled();
+}
+
+// Chunking is a second, independently opt-in switch. This keeps the original
+// one-block candidate available for a matched control and prevents an Auto
+// policy from silently selecting the mapped-host experiment.
+static bool ggml_cuda_rdna3_p2p_chunked_enabled() {
+    const char * value = std::getenv("GGML_HIP_RDNA3_P2P_CHUNKED");
+    if (value == nullptr) {
+        return false;
+    }
+    const auto flag = ggml_cuda_rdna3_auto_parse(value);
+    if (flag == ggml_cuda_rdna3_auto_flag::invalid) {
+        GGML_LOG_WARN("GGML_HIP_RDNA3_P2P_CHUNKED=\"%s\" is not recognized; using one-block P2P candidate\n",
+                value);
+        return false;
+    }
+    return flag == ggml_cuda_rdna3_auto_flag::enabled;
+}
+
+static int ggml_cuda_rdna3_p2p_nblocks(int ne, bool chunked) {
+    if (!chunked) {
+        return 1;
+    }
+    return std::min(int(GGML_CUDA_RDNA3_P2P_MAX_BLOCKS),
+            std::max(1, (ne + 8191) / 8192));
+}
+
+static void ggml_cuda_rdna3_p2p_release(ggml_backend_cuda_comm_context * comm_ctx) {
+    if (!comm_ctx->dev_ids.empty()) {
+        ggml_cuda_set_device(comm_ctx->dev_ids[0]);
+    }
+    if (comm_ctx->rdna3_p2p_snapshots_host != nullptr) {
+        (void) hipHostFree(comm_ctx->rdna3_p2p_snapshots_host);
+    }
+    if (comm_ctx->rdna3_p2p_flags_host != nullptr) {
+        (void) hipHostFree(comm_ctx->rdna3_p2p_flags_host);
+    }
+    comm_ctx->rdna3_p2p_snapshots_host = nullptr;
+    comm_ctx->rdna3_p2p_snapshots_dev.fill(nullptr);
+    comm_ctx->rdna3_p2p_flags_host = nullptr;
+    comm_ctx->rdna3_p2p_flags_dev.fill(nullptr);
+    comm_ctx->rdna3_p2p_initialized = false;
+    comm_ctx->rdna3_p2p_chunked = false;
+    comm_ctx->rdna3_p2p_token = 0;
+    comm_ctx->rdna3_p2p_logged_widths = 0;
+    comm_ctx->rdna3_p2p_exact_widths = 0;
+}
+
+static void ggml_cuda_rdna3_p2p_next_tokens(
+        ggml_backend_cuda_comm_context * comm_ctx, uint32_t & start_token, uint32_t & end_token) {
+    uint32_t serial = ++comm_ctx->rdna3_p2p_token;
+    // Serial zero is the memset value of a fresh flag array. Serial
+    // 0x80000000 would make the even start token wrap to zero as well; skip
+    // both values so a stale initialized flag can never satisfy a new call.
+    if (serial == 0 || serial == 0x80000000u) serial = ++comm_ctx->rdna3_p2p_token;
+    // Keep token comparisons unsigned and exact. A future token must never be
+    // accepted as proof that this call's peer snapshot is ready.
+    start_token = serial * 2u;
+    end_token = start_token + 1u;
+}
+
+static std::vector<float> ggml_cuda_rdna3_p2p_selftest_input(int rank, int pattern, int ne) {
+    std::vector<float> values(ne);
+    std::mt19937 rng(0x6d2b79f5u ^ uint32_t(rank * 131 + pattern * 977));
+    for (int i = 0; i < ne; ++i) {
+        switch (pattern) {
+            case 0:
+                values[i] = float((i % 97) - 48) * 0.03125f * float(rank + 1);
+                break;
+            case 1:
+                values[i] = rank == 0 ? ((i & 1) ? 4096.0f : -4096.0f) :
+                    float((rank * 7 + i % 13) - 10) * 0.0009765625f;
+                break;
+            case 2:
+                values[i] = std::ldexp(float(int(rng() % 2049) - 1024), int(rng() % 18) - 14);
+                break;
+            default: {
+                uint32_t bits = (rng() & 0x807fffffu) | (uint32_t(105 + rng() % 35) << 23);
+                std::memcpy(&values[i], &bits, sizeof(bits));
+                break;
+            }
+        }
+    }
+    return values;
+}
+
+static bool ggml_cuda_rdna3_p2p_runtime_selftest(
+        ggml_backend_cuda_comm_context * comm_ctx, int ne) {
+    constexpr int nr = 2;
+    constexpr int patterns = 4;
+    std::array<float *, nr> inputs{};
+    std::array<float *, nr> custom{};
+    std::array<float *, nr> reference{};
+    auto cleanup = [&]() {
+        for (int rank = 0; rank < nr; ++rank) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+            ggml_cuda_set_device(ctx->device);
+            if (inputs[rank] != nullptr) (void) cudaFree(inputs[rank]);
+            if (custom[rank] != nullptr) (void) cudaFree(custom[rank]);
+            if (reference[rank] != nullptr) (void) cudaFree(reference[rank]);
+        }
+    };
+    auto cuda_ok = [&](cudaError_t rc, const char * operation) {
+        if (rc == cudaSuccess) return true;
+        GGML_LOG_WARN("RDNA2/RDNA3 two-rank P2P startup self-test %s failed for %d elements: %s; using RCCL\n",
+                operation, ne, cudaGetErrorString(rc));
+        (void) cudaGetLastError();
+        return false;
+    };
+    auto nccl_ok = [&](ncclResult_t rc, const char * operation) {
+        if (rc == ncclSuccess) return true;
+        GGML_LOG_WARN("RDNA2/RDNA3 two-rank P2P startup self-test %s failed for %d elements: %s; using RCCL\n",
+                operation, ne, ncclGetErrorString(rc));
+        return false;
+    };
+
+    for (int rank = 0; rank < nr; ++rank) {
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+        ggml_cuda_set_device(ctx->device);
+        if (!cuda_ok(cudaMalloc((void **) &inputs[rank], size_t(ne) * sizeof(float)), "input allocation") ||
+                !cuda_ok(cudaMalloc((void **) &custom[rank], size_t(ne) * sizeof(float)), "custom allocation") ||
+                !cuda_ok(cudaMalloc((void **) &reference[rank], size_t(ne) * sizeof(float)), "reference allocation")) {
+            cleanup();
+            return false;
+        }
+    }
+
+    bool exact = true;
+    for (int pattern = 0; pattern < patterns && exact; ++pattern) {
+        std::array<std::vector<float>, nr> host_inputs;
+        for (int rank = 0; rank < nr; ++rank) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+            host_inputs[rank] = ggml_cuda_rdna3_p2p_selftest_input(rank, pattern, ne);
+            ggml_cuda_set_device(ctx->device);
+            if (!cuda_ok(cudaMemcpyAsync(inputs[rank], host_inputs[rank].data(), size_t(ne) * sizeof(float),
+                            cudaMemcpyHostToDevice, ctx->stream()), "input copy") ||
+                    !cuda_ok(cudaMemcpyAsync(reference[rank], host_inputs[rank].data(), size_t(ne) * sizeof(float),
+                            cudaMemcpyHostToDevice, ctx->stream()), "reference copy")) {
+                exact = false;
+                break;
+            }
+        }
+        for (int rank = 0; rank < nr && exact; ++rank) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+            ggml_cuda_set_device(ctx->device);
+            exact = cuda_ok(cudaStreamSynchronize(ctx->stream()), "input synchronization");
+        }
+        if (!exact) break;
+
+        uint32_t start_token = 0;
+        uint32_t end_token = 0;
+        ggml_cuda_rdna3_p2p_next_tokens(comm_ctx, start_token, end_token);
+        const size_t parity_offset = size_t(comm_ctx->rdna3_p2p_token & (GGML_CUDA_RDNA3_P2P_SNAPSHOT_SLOTS - 1)) *
+            2 * GGML_CUDA_RDNA3_P2P_MAX_ELEMENTS;
+        const int nblocks = ggml_cuda_rdna3_p2p_nblocks(ne, comm_ctx->rdna3_p2p_chunked);
+        for (int rank = 0; rank < nr; ++rank) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+            ggml_cuda_set_device(ctx->device);
+            float * snapshot_base = comm_ctx->rdna3_p2p_snapshots_dev[rank] + parity_offset;
+            unsigned * flags_base = comm_ctx->rdna3_p2p_flags_dev[rank];
+            ggml_cuda_rdna3_p2p_host_reduce<<<nblocks, 1024, 0, ctx->stream()>>>(
+                custom[rank], inputs[rank],
+                snapshot_base + rank * GGML_CUDA_RDNA3_P2P_MAX_ELEMENTS,
+                snapshot_base + (rank ^ 1) * GGML_CUDA_RDNA3_P2P_MAX_ELEMENTS, ne,
+                flags_base + rank * GGML_CUDA_RDNA3_P2P_FLAG_STRIDE,
+                flags_base + (rank ^ 1) * GGML_CUDA_RDNA3_P2P_FLAG_STRIDE,
+                flags_base + rank * GGML_CUDA_RDNA3_P2P_FLAG_STRIDE,
+                flags_base + (rank ^ 1) * GGML_CUDA_RDNA3_P2P_FLAG_STRIDE,
+                start_token, end_token);
+            if (!cuda_ok(cudaGetLastError(), "custom launch")) {
+                exact = false;
+                break;
+            }
+        }
+        if (!exact || !nccl_ok(ncclGroupStart(), "RCCL group start")) {
+            exact = false;
+            break;
+        }
+        for (int rank = 0; rank < nr; ++rank) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+            ggml_cuda_set_device(ctx->device);
+            if (!nccl_ok(ncclAllReduce(reference[rank], reference[rank], ne, ncclFloat, ncclSum,
+                            comm_ctx->comms[rank], ctx->stream()), "RCCL AllReduce")) {
+                exact = false;
+            }
+        }
+        if (!nccl_ok(ncclGroupEnd(), "RCCL group end")) exact = false;
+
+        for (int rank = 0; rank < nr && exact; ++rank) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+            ggml_cuda_set_device(ctx->device);
+            if (!cuda_ok(cudaStreamSynchronize(ctx->stream()), "result synchronization")) {
+                exact = false;
+                break;
+            }
+            std::vector<float> custom_host(ne);
+            std::vector<float> reference_host(ne);
+            if (!cuda_ok(cudaMemcpy(custom_host.data(), custom[rank], size_t(ne) * sizeof(float),
+                            cudaMemcpyDeviceToHost), "custom result copy") ||
+                    !cuda_ok(cudaMemcpy(reference_host.data(), reference[rank], size_t(ne) * sizeof(float),
+                            cudaMemcpyDeviceToHost), "reference result copy")) {
+                exact = false;
+                break;
+            }
+            if (std::memcmp(custom_host.data(), reference_host.data(), size_t(ne) * sizeof(float)) != 0) {
+                std::fprintf(stderr, "RDNA2/RDNA3 two-rank P2P startup self-test differs from RCCL: ne=%d rank=%d custom0=% .9e rccl0=% .9e\n",
+                        ne, rank, custom_host[0], reference_host[0]);
+                GGML_LOG_INFO("RDNA2/RDNA3 two-rank P2P startup self-test differs from installed RCCL for %d elements; using RCCL\n", ne);
+                exact = false;
+            }
+        }
+    }
+
+    cleanup();
+    if (exact) {
+        GGML_LOG_INFO("RDNA2/RDNA3 two-rank P2P startup self-test matched installed RCCL for %d elements (%d patterns)\n",
+                ne, patterns);
+    }
+    return exact;
+}
+
+static bool ggml_cuda_p2p_two_rank_qualified_topology(
+        const ggml_backend_cuda_comm_context * comm_ctx, bool * is_rdna2 = nullptr) {
+    if (is_rdna2 != nullptr) {
+        *is_rdna2 = false;
+    }
+    if (comm_ctx == nullptr || comm_ctx->dev_ids.size() != 2) {
+        return false;
+    }
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    bool have_rdna2 = false;
+    bool have_rdna3 = false;
+    int physical_ids[2] = { -1, -1 };
+    for (int rank = 0; rank < 2; ++rank) {
+        const int logical = comm_ctx->dev_ids[rank];
+        if (logical < 0 || logical >= info.device_count) {
+            return false;
+        }
+        const auto & device = info.devices[logical];
+        // Do not use virtual/aliased devices for a host-snapshot barrier.
+        if (device.physical_device != logical || device.physical_share_count != 1) {
+            return false;
+        }
+        physical_ids[rank] = device.physical_device;
+        if (rank != 0 && physical_ids[rank] == physical_ids[0]) {
+            return false;
+        }
+        const int cc = device.cc;
+        const bool rdna2 = GGML_CUDA_CC_IS_RDNA2(cc);
+        const bool rdna3 = cc == GGML_CUDA_CC_RDNA3;
+        if (!rdna2 && !rdna3 || (have_rdna2 && !rdna2) || (have_rdna3 && !rdna3)) {
+            return false;
+        }
+        have_rdna2 = have_rdna2 || rdna2;
+        have_rdna3 = have_rdna3 || rdna3;
+
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, logical) != cudaSuccess ||
+                std::strcmp(prop.gcnArchName, rdna2 ? "gfx1030" : "gfx1100") != 0 ||
+                (rdna3 && std::strcmp(prop.name, "AMD Radeon RX 7900 XT") != 0)) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const int src = comm_ctx->dev_ids[rank];
+        const int dst = comm_ctx->dev_ids[rank ^ 1];
+        int can_access = 0;
+        if (cudaDeviceCanAccessPeer(&can_access, src, dst) != cudaSuccess || !can_access) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+    if (is_rdna2 != nullptr) {
+        *is_rdna2 = have_rdna2;
+    }
+    return true;
+}
+
+static uint32_t ggml_cuda_rdna3_p2p_width_bit(int64_t width) {
+    return width >= 1 && width <= 6 ? 1u << uint32_t(width - 1) : 0;
+}
+
+static bool ggml_cuda_rdna3_p2p_width_exact(
+        const ggml_backend_cuda_comm_context * comm_ctx, int64_t width) {
+    const uint32_t bit = ggml_cuda_rdna3_p2p_width_bit(width);
+    return bit != 0 && (comm_ctx->rdna3_p2p_exact_widths & bit) != 0;
+}
+
+static bool ggml_cuda_rdna3_p2p_init(ggml_backend_cuda_comm_context * comm_ctx) {
+    if (comm_ctx->backends.size() != 2 || comm_ctx->dev_ids.size() != 2) {
+        return false;
+    }
+
+    bool is_rdna2 = false;
+    const bool topology_qualified = ggml_cuda_p2p_two_rank_qualified_topology(comm_ctx, &is_rdna2);
+    const bool auto_requested = topology_qualified && is_rdna2 &&
+        ggml_cuda_rdna2_auto_enabled();
+    const bool explicit_set = ggml_cuda_rdna3_p2p_explicitly_set();
+    const bool explicit_enabled = explicit_set && ggml_cuda_rdna3_p2p_explicitly_enabled();
+
+    // RDNA2_AUTO is the existing global kill switch for automatic RDNA2
+    // paths. RDNA3_AUTO is intentionally opt-in and is already topology
+    // qualified by ggml_cuda_rdna3_auto_apply(), but it only installs the
+    // validated RCCL/direct-P2P policy; it does not arm this preliminary
+    // host-snapshot candidate. An explicit generic flag can still request the
+    // supervised candidate on RDNA3, but never bypasses the RDNA2 global kill
+    // switch.
+    if (is_rdna2 && !ggml_cuda_rdna2_auto_enabled()) {
+        return false;
+    }
+    if (explicit_set ? !explicit_enabled : !auto_requested) {
+        return false;
+    }
+
+    std::fprintf(stderr, "two-rank RDNA2/RDNA3 P2P candidate init requested (%s): backends=%zu devices=%d,%d\n",
+            explicit_set ? "explicit" : "Auto", comm_ctx->backends.size(),
+            comm_ctx->dev_ids[0], comm_ctx->dev_ids[1]);
+    if (!topology_qualified) {
+        GGML_LOG_INFO("two-rank P2P AllReduce: native RDNA2/RDNA3 identity/topology guard failed; using RCCL\n");
+        return false;
+    }
+
+    for (int rank = 0; rank < 2; ++rank) {
+        const int device = comm_ctx->dev_ids[rank];
+        const int other = comm_ctx->dev_ids[rank ^ 1];
+        ggml_cuda_set_device(device);
+        int can_access = 0;
+        if (cudaDeviceCanAccessPeer(&can_access, device, other) != cudaSuccess || !can_access) {
+            GGML_LOG_WARN("two-rank native P2P AllReduce: peer check %d -> %d failed; using RCCL\n", device, other);
+            (void) cudaGetLastError();
+            return false;
+        }
+        const cudaError_t peer_rc = cudaDeviceEnablePeerAccess(other, 0);
+        if (peer_rc != cudaSuccess && peer_rc != cudaErrorPeerAccessAlreadyEnabled) {
+            GGML_LOG_WARN("two-rank native P2P AllReduce: peer enable %d -> %d failed: %s; using RCCL\n",
+                    device, other, cudaGetErrorString(peer_rc));
+            (void) cudaGetLastError();
+            return false;
+        }
+        (void) cudaGetLastError();
+    }
+
+    // A chunked run must be explicitly requested together with the generic
+    // P2P enable flag; RDNA2 Auto may retain the one-block candidate but can
+    // never silently promote itself to this newer protocol.
+    comm_ctx->rdna3_p2p_chunked = explicit_set && ggml_cuda_rdna3_p2p_chunked_enabled();
+
+    ggml_cuda_set_device(comm_ctx->dev_ids[0]);
+    if (hipHostMalloc((void **) &comm_ctx->rdna3_p2p_flags_host,
+                2 * GGML_CUDA_RDNA3_P2P_FLAG_STRIDE * sizeof(unsigned),
+                hipHostMallocPortable | hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess) {
+        GGML_LOG_WARN("RDNA2/RDNA3 two-rank P2P AllReduce: mapped flag allocation failed; using RCCL\n");
+        (void) hipGetLastError();
+        return false;
+    }
+    std::memset(comm_ctx->rdna3_p2p_flags_host, 0,
+            2 * GGML_CUDA_RDNA3_P2P_FLAG_STRIDE * sizeof(unsigned));
+    for (int rank = 0; rank < 2; ++rank) {
+        ggml_cuda_set_device(comm_ctx->dev_ids[rank]);
+        if (hipHostGetDevicePointer((void **) &comm_ctx->rdna3_p2p_flags_dev[rank],
+                    comm_ctx->rdna3_p2p_flags_host, 0) != hipSuccess ||
+                comm_ctx->rdna3_p2p_flags_dev[rank] == nullptr) {
+            GGML_LOG_WARN("RDNA2/RDNA3 two-rank P2P AllReduce: mapped flag device pointer failed on rank %d; using RCCL\n",
+                    rank);
+            ggml_cuda_rdna3_p2p_release(comm_ctx);
+            (void) hipGetLastError();
+            return false;
+        }
+    }
+    if (hipHostMalloc((void **) &comm_ctx->rdna3_p2p_snapshots_host,
+                2 * GGML_CUDA_RDNA3_P2P_SNAPSHOT_SLOTS * 2 * GGML_CUDA_RDNA3_P2P_MAX_ELEMENTS * sizeof(float),
+                hipHostMallocPortable | hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess) {
+        GGML_LOG_WARN("RDNA2/RDNA3 two-rank P2P AllReduce: mapped snapshot allocation failed; using RCCL\n");
+        (void) hipGetLastError();
+        ggml_cuda_rdna3_p2p_release(comm_ctx);
+        return false;
+    }
+    std::memset(comm_ctx->rdna3_p2p_snapshots_host, 0,
+            2 * GGML_CUDA_RDNA3_P2P_SNAPSHOT_SLOTS * 2 * GGML_CUDA_RDNA3_P2P_MAX_ELEMENTS * sizeof(float));
+    for (int rank = 0; rank < 2; ++rank) {
+        ggml_cuda_set_device(comm_ctx->dev_ids[rank]);
+        if (hipHostGetDevicePointer((void **) &comm_ctx->rdna3_p2p_snapshots_dev[rank],
+                    comm_ctx->rdna3_p2p_snapshots_host, 0) != hipSuccess ||
+                comm_ctx->rdna3_p2p_snapshots_dev[rank] == nullptr) {
+            GGML_LOG_WARN("RDNA2/RDNA3 two-rank P2P AllReduce: mapped snapshot device pointer failed on rank %d; using RCCL\n",
+                    rank);
+            ggml_cuda_rdna3_p2p_release(comm_ctx);
+            (void) hipGetLastError();
+            return false;
+        }
+    }
+
+    // Auto is qualified only for ordinary width-one decode. Explicit modes
+    // retain wider self-tested shapes for supervised one-block/chunked A/Bs.
+    // A failed width is refused independently while RCCL handles every other
+    // shape.
+    for (int width = 1; width <= 6; ++width) {
+        if (!ggml_cuda_p2p_two_rank_width_allowed(explicit_set, width)) {
+            continue;
+        }
+        const bool exact = ggml_cuda_rdna3_p2p_runtime_selftest(comm_ctx, 5120 * width);
+        if (exact) {
+            comm_ctx->rdna3_p2p_exact_widths |= ggml_cuda_rdna3_p2p_width_bit(width);
+        }
+        std::fprintf(stderr, "two-rank P2P candidate selftest width%d=%d\n", width, exact ? 1 : 0);
+    }
+    if (comm_ctx->rdna3_p2p_exact_widths == 0) {
+        ggml_cuda_rdna3_p2p_release(comm_ctx);
+        return false;
+    }
+    comm_ctx->rdna3_p2p_initialized = true;
+    GGML_LOG_INFO("armed experimental two-rank RDNA2/RDNA3 host-snapshot AllReduce after RCCL self-tests (width_mask=0x%x, chunked=%d, max_blocks=%u)\n",
+            comm_ctx->rdna3_p2p_exact_widths, comm_ctx->rdna3_p2p_chunked ? 1 : 0,
+            GGML_CUDA_RDNA3_P2P_MAX_BLOCKS);
+    return true;
+}
+
+static bool ggml_backend_cuda_comm_allreduce_rdna3_p2p(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    if (!comm_ctx->rdna3_p2p_initialized || !ggml_cuda_rdna3_p2p_ordinary_requested() ||
+            comm_ctx->backends.size() != 2) return false;
+    const ggml_tensor * tensor = tensors[0];
+    if (tensor == nullptr || tensor->type != GGML_TYPE_F32 || tensor->data == nullptr ||
+            (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            (tensor->flags & GGML_TENSOR_FLAG_FORCE_FP32_ALLREDUCE) != 0 ||
+            tensor->ne[0] != 5120 || tensor->ne[1] < 1 || tensor->ne[1] > 6 ||
+            tensor->ne[2] != 1 || tensor->ne[3] != 1 || !ggml_is_contiguously_allocated(tensor) ||
+            !ggml_cuda_rdna3_p2p_width_exact(comm_ctx, tensor->ne[1])) {
+        return false;
+    }
+    const int64_t ne = ggml_nelements(tensor);
+    if (ne != tensor->ne[0] * tensor->ne[1] || ne <= 0 ||
+            size_t(ne) > GGML_CUDA_RDNA3_P2P_MAX_ELEMENTS) return false;
+    for (int rank = 0; rank < 2; ++rank) {
+        if (tensors[rank] == nullptr || tensors[rank]->type != GGML_TYPE_F32 ||
+                tensors[rank]->data == nullptr || (tensors[rank]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                (tensors[rank]->flags & GGML_TENSOR_FLAG_FORCE_FP32_ALLREDUCE) != 0 ||
+                tensors[rank]->ne[0] != tensor->ne[0] || tensors[rank]->ne[1] != tensor->ne[1] ||
+                tensors[rank]->ne[2] != 1 || tensors[rank]->ne[3] != 1 ||
+                !ggml_is_contiguously_allocated(tensors[rank])) return false;
+    }
+    const auto * ctx0 = static_cast<const ggml_backend_cuda_context *>(comm_ctx->backends[0]->context);
+    const auto * ctx1 = static_cast<const ggml_backend_cuda_context *>(comm_ctx->backends[1]->context);
+    if (ctx0 == nullptr || ctx1 == nullptr ||
+            ctx0->device != comm_ctx->dev_ids[0] || ctx1->device != comm_ctx->dev_ids[1] ||
+            ctx0->curr_stream_no != ctx1->curr_stream_no) return false;
+
+    std::lock_guard<std::mutex> lock(comm_ctx->rdna3_p2p_launch_mutex);
+    uint32_t start_token = 0;
+    uint32_t end_token = 0;
+    ggml_cuda_rdna3_p2p_next_tokens(comm_ctx, start_token, end_token);
+    const int64_t nelements = ggml_nelements(tensor);
+    const size_t parity_offset = size_t(comm_ctx->rdna3_p2p_token & (GGML_CUDA_RDNA3_P2P_SNAPSHOT_SLOTS - 1)) *
+        2 * GGML_CUDA_RDNA3_P2P_MAX_ELEMENTS;
+    const int nblocks = ggml_cuda_rdna3_p2p_nblocks(int(nelements), comm_ctx->rdna3_p2p_chunked);
+    for (int rank = 0; rank < 2; ++rank) {
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+        ggml_cuda_set_device(ctx->device);
+        float * snapshot_base = comm_ctx->rdna3_p2p_snapshots_dev[rank] + parity_offset;
+        unsigned * flags_base = comm_ctx->rdna3_p2p_flags_dev[rank];
+        ggml_cuda_rdna3_p2p_host_reduce<<<nblocks, 1024, 0, ctx->stream()>>>(
+            static_cast<float *>(tensors[rank]->data), static_cast<const float *>(tensors[rank]->data),
+            snapshot_base + rank * GGML_CUDA_RDNA3_P2P_MAX_ELEMENTS,
+            snapshot_base + (rank ^ 1) * GGML_CUDA_RDNA3_P2P_MAX_ELEMENTS, int(nelements),
+            flags_base + rank * GGML_CUDA_RDNA3_P2P_FLAG_STRIDE,
+            flags_base + (rank ^ 1) * GGML_CUDA_RDNA3_P2P_FLAG_STRIDE,
+            flags_base + rank * GGML_CUDA_RDNA3_P2P_FLAG_STRIDE,
+            flags_base + (rank ^ 1) * GGML_CUDA_RDNA3_P2P_FLAG_STRIDE,
+            start_token, end_token);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    ++comm_ctx->rdna3_p2p_calls;
+    const uint32_t bit = ggml_cuda_rdna3_p2p_width_bit(tensor->ne[1]);
+    if ((comm_ctx->rdna3_p2p_logged_widths & bit) == 0) {
+        comm_ctx->rdna3_p2p_logged_widths |= bit;
+        std::fprintf(stderr, "using experimental two-rank native P2P host-snapshot AllReduce for %s [5120,%" PRId64 ",1,1] F32 (blocks=%d)\n",
+                tensor->name, tensor->ne[1], nblocks);
+    }
+    return true;
+}
+
+#endif
+
+#if defined(GGML_USE_HIP) && defined(GGML_USE_NCCL)
+static std::vector<float> ggml_cuda_rdna2_p2p_selftest_input(int rank, int pattern, int ne) {
+    std::vector<float> values(ne);
+    std::mt19937 rng(0x9e3779b9u ^ uint32_t(rank * 131 + pattern * 977));
+    for (int i = 0; i < ne; ++i) {
+        switch (pattern) {
+            case 0:
+                values[i] = float((i % 97) - 48) * 0.03125f * float(rank + 1);
+                break;
+            case 1:
+                values[i] = rank == 0 ? ((i & 1) ? 4096.0f : -4096.0f) :
+                    float((rank * 7 + i % 13) - 10) * 0.0009765625f;
+                break;
+            case 2:
+                values[i] = std::ldexp(float(int(rng() % 2049) - 1024), int(rng() % 18) - 14);
+                break;
+            default: {
+                uint32_t bits = (rng() & 0x807fffffu) | (uint32_t(105 + rng() % 35) << 23);
+                std::memcpy(&values[i], &bits, sizeof(bits));
+                break;
+            }
+        }
+    }
+    return values;
+}
+
+static bool ggml_cuda_rdna2_p2p_runtime_selftest(
+        ggml_backend_cuda_comm_context * comm_ctx, int ne) {
+    constexpr int nr = 4;
+    constexpr int patterns = 4;
+    constexpr int repeats = 16;
+    std::array<float *, nr> custom{};
+    std::array<float *, nr> reference{};
+
+    auto cleanup = [&]() {
+        for (int rank = 0; rank < nr; ++rank) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+            ggml_cuda_set_device(ctx->device);
+            if (custom[rank] != nullptr) {
+                (void) cudaFree(custom[rank]);
+            }
+            if (reference[rank] != nullptr) {
+                (void) cudaFree(reference[rank]);
+            }
+        }
+    };
+    auto cuda_ok = [&](cudaError_t rc, const char * operation) {
+        if (rc == cudaSuccess) {
+            return true;
+        }
+        GGML_LOG_WARN("RDNA2 P2P startup self-test %s failed for %d elements: %s; using RCCL\n",
+                operation, ne, cudaGetErrorString(rc));
+        (void) cudaGetLastError();
+        return false;
+    };
+    auto nccl_ok = [&](ncclResult_t rc, const char * operation) {
+        if (rc == ncclSuccess) {
+            return true;
+        }
+        GGML_LOG_WARN("RDNA2 P2P startup self-test %s failed for %d elements: %s; using RCCL\n",
+                operation, ne, ncclGetErrorString(rc));
+        return false;
+    };
+
+    for (int rank = 0; rank < nr; ++rank) {
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+        ggml_cuda_set_device(ctx->device);
+        if (!cuda_ok(cudaMalloc((void **) &custom[rank], size_t(ne) * sizeof(float)), "custom allocation") ||
+                !cuda_ok(cudaMalloc((void **) &reference[rank], size_t(ne) * sizeof(float)), "reference allocation")) {
+            cleanup();
+            return false;
+        }
+    }
+
+    bool exact = true;
+    for (int pattern = 0; pattern < patterns && exact; ++pattern) {
+        std::array<std::vector<float>, nr> inputs;
+        for (int rank = 0; rank < nr; ++rank) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+            inputs[rank] = ggml_cuda_rdna2_p2p_selftest_input(rank, pattern, ne);
+            ggml_cuda_set_device(ctx->device);
+            if (!cuda_ok(cudaMemcpyAsync(custom[rank], inputs[rank].data(), size_t(ne) * sizeof(float),
+                            cudaMemcpyHostToDevice, ctx->stream()), "custom input copy") ||
+                    !cuda_ok(cudaMemcpyAsync(reference[rank], inputs[rank].data(), size_t(ne) * sizeof(float),
+                            cudaMemcpyHostToDevice, ctx->stream()), "reference input copy")) {
+                exact = false;
+                break;
+            }
+        }
+        for (int rank = 0; rank < nr && exact; ++rank) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+            ggml_cuda_set_device(ctx->device);
+            exact = cuda_ok(cudaStreamSynchronize(ctx->stream()), "input synchronization");
+        }
+
+        for (int rep = 0; rep < repeats && exact; ++rep) {
+            const uint32_t token = ggml_cuda_p2p_next_token(comm_ctx->p2p_host_token);
+            constexpr size_t snapshot_stride = GGML_CUDA_RDNA2_P2P_SNAPSHOT_STRIDE;
+            const size_t parity_offset =
+                size_t(comm_ctx->p2p_host_token & (GGML_CUDA_RDNA2_P2P_SNAPSHOT_SLOTS - 1)) *
+                nr * snapshot_stride;
+            for (int rank = 0; rank < nr; ++rank) {
+                auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+                ggml_cuda_set_device(ctx->device);
+                float * snapshot_base = comm_ctx->p2p_host_snapshots_dev[rank] + parity_offset;
+                const float * snapshots[nr] = {
+                    snapshot_base,
+                    snapshot_base + snapshot_stride,
+                    snapshot_base + 2 * snapshot_stride,
+                    snapshot_base + 3 * snapshot_stride,
+                };
+                unsigned * flags = comm_ctx->p2p_host_flags_dev[rank];
+                if (ne == 2560) {
+                    ggml_cuda_rdna2_p2p_host_snapshot_reduce_2560<<<1, 1024, 0, ctx->stream()>>>(
+                        custom[rank], const_cast<float *>(snapshots[rank]),
+                        snapshots[0], snapshots[1], snapshots[2], snapshots[3], rank,
+                        flags, token);
+                } else if (ne == 30720) {
+                    ggml_cuda_rdna2_p2p_host_snapshot_reduce_dflash6_30720<<<1, 1024, 0, ctx->stream()>>>(
+                        custom[rank], const_cast<float *>(snapshots[rank]),
+                        snapshots[0], snapshots[1], snapshots[2], snapshots[3], rank,
+                        flags, token);
+                } else if (ne == 25600) {
+                    ggml_cuda_rdna2_p2p_host_snapshot_reduce_mtp5_25600<<<1, 1024, 0, ctx->stream()>>>(
+                        custom[rank], const_cast<float *>(snapshots[rank]),
+                        snapshots[0], snapshots[1], snapshots[2], snapshots[3], rank,
+                        flags, token);
+                } else {
+                    ggml_cuda_rdna2_p2p_host_snapshot_reduce_5120<<<1, 1024, 0, ctx->stream()>>>(
+                        custom[rank], const_cast<float *>(snapshots[rank]),
+                        snapshots[0], snapshots[1], snapshots[2], snapshots[3], rank,
+                        flags, token);
+                }
+                if (!cuda_ok(cudaGetLastError(), "custom launch")) {
+                    exact = false;
+                    break;
+                }
+            }
+            if (!exact || !nccl_ok(ncclGroupStart(), "RCCL group start")) {
+                exact = false;
+                break;
+            }
+            for (int rank = 0; rank < nr; ++rank) {
+                auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+                ggml_cuda_set_device(ctx->device);
+                if (!nccl_ok(ncclAllReduce(reference[rank], reference[rank], ne, ncclFloat, ncclSum,
+                                comm_ctx->comms[rank], ctx->stream()), "RCCL AllReduce")) {
+                    exact = false;
+                }
+            }
+            if (!nccl_ok(ncclGroupEnd(), "RCCL group end")) {
+                exact = false;
+            }
+        }
+
+        for (int rank = 0; rank < nr && exact; ++rank) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+            ggml_cuda_set_device(ctx->device);
+            if (!cuda_ok(cudaStreamSynchronize(ctx->stream()), "result synchronization")) {
+                exact = false;
+                break;
+            }
+            std::vector<float> custom_host(ne);
+            std::vector<float> reference_host(ne);
+            if (!cuda_ok(cudaMemcpy(custom_host.data(), custom[rank], size_t(ne) * sizeof(float),
+                            cudaMemcpyDeviceToHost), "custom result copy") ||
+                    !cuda_ok(cudaMemcpy(reference_host.data(), reference[rank], size_t(ne) * sizeof(float),
+                            cudaMemcpyDeviceToHost), "reference result copy")) {
+                exact = false;
+                break;
+            }
+            if (std::memcmp(custom_host.data(), reference_host.data(), size_t(ne) * sizeof(float)) != 0) {
+                GGML_LOG_INFO("RDNA2 P2P startup self-test differs from installed RCCL for %d elements; using RCCL\n", ne);
+                exact = false;
+            }
+        }
+    }
+
+    cleanup();
+    if (exact) {
+        GGML_LOG_INFO("RDNA2 P2P startup self-test matched installed RCCL for %d elements (%d patterns x %d chains)\n",
+                ne, patterns, repeats);
+    }
+    return exact;
+}
+#endif
+
+static std::mutex ggml_cuda_rdna2_bf16_hidden_audit_mutex;
+static std::atomic<uint64_t> ggml_cuda_rdna2_bf16_hidden_audit_next_context{0};
+
+void ggml_backend_cuda_comm_context::write_rdna2_bf16_hidden_audit() const {
+    if (rdna2_bf16_hidden_audit_path.empty()) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_cuda_audit_nonzero_decision_count(audit) ==
+            audit.allreduce_calls - audit.zero_element_calls);
+
+    std::ostringstream line;
+    line << "{\"schema_version\":1,\"context_id\":" << audit_context_id
+         << ",\"candidate_enabled\":" << (rdna2_bf16_hidden_enabled ? "true" : "false")
+         << ",\"candidate_topology\":" << (rdna2_bf16_hidden_topology ? "true" : "false")
+         << ",\"backend_count\":" << dev_ids.size() << ",\"logical_devices\":[";
+    for (size_t i = 0; i < dev_ids.size(); ++i) {
+        line << (i == 0 ? "" : ",") << dev_ids[i];
+    }
+    line << "],\"allreduce_calls\":" << audit.allreduce_calls
+         << ",\"zero_element_calls\":" << audit.zero_element_calls
+         << ",\"candidate_eligible_calls\":" << audit.candidate_eligible_calls
+         << ",\"candidate_bf16_calls\":" << audit.candidate_bf16_calls
+         << ",\"candidate_disabled_fp32_calls\":" << audit.candidate_disabled_calls
+         << ",\"force_fp32_calls\":" << audit.force_fp32_calls
+         << ",\"force_candidate_conflict_calls\":" << audit.force_candidate_conflicts
+         << ",\"legacy_fp32_calls\":" << audit.legacy_fp32_calls
+         << ",\"legacy_bf16_calls\":" << audit.legacy_bf16_calls
+         << ",\"ne4096_calls\":" << audit_ne4096_calls
+         << ",\"ne4096_all_f32_calls\":" << audit_ne4096_all_f32_calls
+         << ",\"ne4096_same_shape_calls\":" << audit_ne4096_same_shape_calls
+         << ",\"first_ne4096_shape\":[" << audit_first_ne4096_shape[0] << ","
+         << audit_first_ne4096_shape[1] << "," << audit_first_ne4096_shape[2] << ","
+         << audit_first_ne4096_shape[3] << "]"
+         << ",\"complete\":true}\n";
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_rdna2_bf16_hidden_audit_mutex);
+    if (!ggml_cuda_append_allreduce_audit_line(rdna2_bf16_hidden_audit_path.c_str(), line.str())) {
+        GGML_ABORT("failed to append RDNA2 BF16 hidden AllReduce audit file: %s",
+                rdna2_bf16_hidden_audit_path.c_str());
+    }
+}
+
 #ifdef GGML_USE_NCCL
+static bool ggml_cuda_rdna2_p2p_host_same_stream(
+        const ggml_backend_cuda_comm_context * comm_ctx) {
+    if (comm_ctx == nullptr || comm_ctx->backends.size() != 4 || comm_ctx->dev_ids.size() != 4) {
+        return false;
+    }
+    int stream_no = -1;
+    for (int rank = 0; rank < 4; ++rank) {
+        const auto * ctx = static_cast<const ggml_backend_cuda_context *>(
+            comm_ctx->backends[rank]->context);
+        if (ctx == nullptr || ctx->device != comm_ctx->dev_ids[rank] ||
+                (rank != 0 && ctx->curr_stream_no != stream_no)) {
+            return false;
+        }
+        stream_no = ctx->curr_stream_no;
+    }
+    return true;
+}
+
+static bool ggml_backend_cuda_comm_allreduce_rdna2_p2p_host_fused_prefix(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors,
+        struct ggml_tensor ** reshapes, struct ggml_tensor ** adds,
+        struct ggml_tensor ** rms_norms, struct ggml_tensor ** muls) {
+    constexpr const char * op_prefix = "linear_attn_out-";
+    constexpr size_t op_prefix_len = sizeof("linear_attn_out-") - 1;
+    const int mode = ggml_cuda_rdna2_p2p_host_allreduce_mode();
+    if ((mode != GGML_CUDA_RDNA2_P2P_HOST_FUSED &&
+         mode != GGML_CUDA_RDNA2_P2P_HOST_MTP &&
+         mode != GGML_CUDA_RDNA2_P2P_HOST_AUTO_EXPANDED) ||
+            !comm_ctx->p2p_host_initialized || !comm_ctx->p2p_host_exact_5120 ||
+            !comm_ctx->rdna2_bf16_hidden_topology ||
+            !ggml_cuda_rdna2_p2p_host_same_stream(comm_ctx)) {
+        return false;
+    }
+    const float * residuals[4] = {};
+    float * add_dsts[4] = {};
+    const float * weights[4] = {};
+    float * mul_dsts[4] = {};
+    float eps[4] = {};
+    for (int rank = 0; rank < 4; ++rank) {
+        ggml_tensor * tensor = tensors[rank];
+        ggml_tensor * reshape = reshapes[rank];
+        ggml_tensor * add = adds[rank];
+        ggml_tensor * rms = rms_norms[rank];
+        ggml_tensor * mul = muls[rank];
+        const bool linear_name = tensor != nullptr &&
+            std::strncmp(tensor->name, op_prefix, op_prefix_len) == 0;
+        const bool expanded_name = tensor != nullptr && mode == GGML_CUDA_RDNA2_P2P_HOST_AUTO_EXPANDED &&
+            (std::strncmp(tensor->name, "ffn_out-", sizeof("ffn_out-") - 1) == 0 ||
+             std::strncmp(tensor->name, "attn_output-", sizeof("attn_output-") - 1) == 0);
+        const bool name_ok = linear_name || expanded_name;
+        if (tensor == nullptr || reshape == nullptr || add == nullptr || rms == nullptr || mul == nullptr ||
+                tensor->data == nullptr || tensor->type != GGML_TYPE_F32 ||
+                tensor->ne[0] != 5120 || tensor->ne[1] != 1 || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+                (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                !name_ok || !ggml_is_contiguously_allocated(tensor) ||
+                reshape->op != GGML_OP_RESHAPE || reshape->src[0] != tensor ||
+                add->op != GGML_OP_ADD || add->src[0] != reshape || add->src[1] == nullptr ||
+                rms->op != GGML_OP_RMS_NORM || rms->src[0] != add ||
+                mul->op != GGML_OP_MUL || mul->src[0] != rms || mul->src[1] == nullptr ||
+                add->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+                add->src[1]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 ||
+                !ggml_are_same_shape(tensor, add->src[1]) || !ggml_are_same_shape(tensor, add) ||
+                !ggml_are_same_shape(tensor, rms) || !ggml_are_same_shape(tensor, mul) ||
+                ggml_nelements(mul->src[1]) != 5120 || !ggml_is_contiguous(add->src[1]) ||
+                !ggml_is_contiguous(add) || !ggml_is_contiguous(mul->src[1]) || !ggml_is_contiguous(mul)) {
+            return false;
+        }
+        std::memcpy(&eps[rank], rms->op_params, sizeof(float));
+        if (!(eps[rank] >= 0.0f) || eps[rank] != eps[0]) {
+            return false;
+        }
+        residuals[rank] = static_cast<const float *>(add->src[1]->data);
+        add_dsts[rank] = static_cast<float *>(add->data);
+        weights[rank] = static_cast<const float *>(mul->src[1]->data);
+        mul_dsts[rank] = static_cast<float *>(mul->data);
+    }
+
+    std::lock_guard<std::mutex> lock(comm_ctx->p2p_host_launch_mutex);
+    const uint32_t token = ggml_cuda_p2p_next_token(comm_ctx->p2p_host_token);
+    const size_t parity_offset =
+        size_t(comm_ctx->p2p_host_token & (GGML_CUDA_RDNA2_P2P_SNAPSHOT_SLOTS - 1)) *
+        4 * GGML_CUDA_RDNA2_P2P_SNAPSHOT_STRIDE;
+    for (int rank = 0; rank < 4; ++rank) {
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+        ggml_cuda_set_device(ctx->device);
+        float * snapshot_base = comm_ctx->p2p_host_snapshots_dev[rank] + parity_offset;
+        const float * snapshots[4] = {
+            snapshot_base,
+            snapshot_base + GGML_CUDA_RDNA2_P2P_SNAPSHOT_STRIDE,
+            snapshot_base + 2 * GGML_CUDA_RDNA2_P2P_SNAPSHOT_STRIDE,
+            snapshot_base + 3 * GGML_CUDA_RDNA2_P2P_SNAPSHOT_STRIDE,
+        };
+        ggml_cuda_rdna2_p2p_host_snapshot_reduce_add_rms_mul_5120<<<1, 1024, 32*sizeof(float), ctx->stream()>>>(
+            static_cast<float *>(tensors[rank]->data), const_cast<float *>(snapshots[rank]),
+            snapshots[0], snapshots[1], snapshots[2], snapshots[3], residuals[rank], add_dsts[rank],
+            weights[rank], mul_dsts[rank], eps[rank], rank,
+            comm_ctx->p2p_host_flags_dev[rank], token);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    ++comm_ctx->p2p_host_calls;
+    const uint32_t bit = ggml_cuda_rdna2_p2p_host_width_bit(1);
+    if ((comm_ctx->p2p_host_logged_widths & bit) == 0) {
+        comm_ctx->p2p_host_logged_widths |= bit;
+        std::fprintf(stderr, "using RDNA2 P2P consumer-fused host-snapshot AllReduce for %s [5120,1,1,1] F32\n",
+                tensors[0]->name);
+    }
+    return true;
+}
+
+static bool ggml_backend_cuda_comm_allreduce_rdna2_p2p_host(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    constexpr const char * linear_prefix = "linear_attn_out-";
+    constexpr size_t linear_prefix_len = sizeof("linear_attn_out-") - 1;
+    if (!comm_ctx->p2p_host_initialized || !comm_ctx->rdna2_bf16_hidden_topology ||
+            !ggml_cuda_rdna2_p2p_host_same_stream(comm_ctx)) {
+        return false;
+    }
+    const auto route = tensors[0] == nullptr
+        ? ggml_cuda_rdna2_p2p_host_route_result {
+              ggml_cuda_rdna2_p2p_host_route::fallback,
+              ggml_cuda_rdna2_p2p_host_fallback_reason::unrelated_shape }
+        : ggml_cuda_rdna2_p2p_host_select_route(
+              tensors[0]->ne[0], tensors[0]->ne[1], tensors[0]->ne[2], tensors[0]->ne[3],
+              ggml_cuda_rdna2_p2p_host_allreduce_mtp_enabled(),
+              comm_ctx->p2p_host_exact_2560, comm_ctx->p2p_host_exact_5120,
+              comm_ctx->p2p_host_exact_25600, comm_ctx->p2p_host_exact_30720);
+    if (route.route == ggml_cuda_rdna2_p2p_host_route::fallback) {
+        // Unsupported shapes are an expected RCCL fallback, not a warning. Only
+        // report a shape whose optimized kernel exists but failed its exactness
+        // self-test.
+        if (route.fallback_reason == ggml_cuda_rdna2_p2p_host_fallback_reason::self_test_failed) {
+            const int64_t width = tensors[0] != nullptr ? tensors[0]->ne[1] : 0;
+            const uint32_t bit = ggml_cuda_rdna2_p2p_host_width_bit(width);
+            if (bit != 0 && (comm_ctx->p2p_host_refused_widths & bit) == 0) {
+                comm_ctx->p2p_host_refused_widths |= bit;
+                GGML_LOG_WARN("RDNA2 P2P host-snapshot AllReduce implements batch width %d, but its "
+                        "startup exactness self-test did not pass; using RCCL.\n", int(width));
+            }
+        }
+        return false;
+    }
+    const bool qwen4exp = route.route == ggml_cuda_rdna2_p2p_host_route::qwen4exp_width1;
+    const bool mtp5 = route.route == ggml_cuda_rdna2_p2p_host_route::speculative_width5;
+    const bool mtp6 = route.route == ggml_cuda_rdna2_p2p_host_route::speculative_width6;
+    for (int rank = 0; rank < 4; ++rank) {
+        if (tensors[rank] == nullptr || tensors[rank]->data == nullptr) {
+            return false;
+        }
+        const bool speculative = mtp5 || mtp6;
+        const bool expanded_ordinary = !speculative &&
+            ggml_cuda_rdna2_p2p_host_allreduce_mode() == GGML_CUDA_RDNA2_P2P_HOST_AUTO_EXPANDED;
+        const bool qwen4exp_name =
+            std::strncmp(tensors[rank]->name, "linear_attn_out-", sizeof("linear_attn_out-") - 1) == 0 ||
+            std::strncmp(tensors[rank]->name, "ffn_moe_out-", sizeof("ffn_moe_out-") - 1) == 0 ||
+            std::strncmp(tensors[rank]->name, "attn_output-", sizeof("attn_output-") - 1) == 0;
+        const bool name_ok = qwen4exp ? qwen4exp_name : speculative
+            ? (std::strncmp(tensors[rank]->name, "linear_attn_out-", 16) == 0 ||
+               std::strncmp(tensors[rank]->name, "ffn_out-", 8) == 0 ||
+               std::strncmp(tensors[rank]->name, "attn_output-", 12) == 0)
+            : (std::strncmp(tensors[rank]->name, linear_prefix, linear_prefix_len) == 0 ||
+               (expanded_ordinary && (std::strncmp(tensors[rank]->name, "ffn_out-", 8) == 0 ||
+                                       std::strncmp(tensors[rank]->name, "attn_output-", 12) == 0)));
+        if (tensors[rank]->type != GGML_TYPE_F32 ||
+                tensors[rank]->ne[0] != (qwen4exp ? 2560 : 5120) ||
+                tensors[rank]->ne[1] != (mtp5 ? 5 : mtp6 ? 6 : 1) ||
+                tensors[rank]->ne[2] != 1 || tensors[rank]->ne[3] != 1 ||
+                (tensors[rank]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !name_ok ||
+                !ggml_is_contiguously_allocated(tensors[rank])) {
+            return false;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(comm_ctx->p2p_host_launch_mutex);
+    const uint32_t token = ggml_cuda_p2p_next_token(comm_ctx->p2p_host_token);
+    constexpr size_t snapshot_stride = GGML_CUDA_RDNA2_P2P_SNAPSHOT_STRIDE;
+    const size_t parity_offset =
+        size_t(comm_ctx->p2p_host_token & (GGML_CUDA_RDNA2_P2P_SNAPSHOT_SLOTS - 1)) *
+        4 * snapshot_stride;
+    for (int rank = 0; rank < 4; ++rank) {
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[rank]->context);
+        ggml_cuda_set_device(ctx->device);
+        float * snapshot_base = comm_ctx->p2p_host_snapshots_dev[rank] + parity_offset;
+        const float * snapshots[4] = {
+            snapshot_base,
+            snapshot_base + snapshot_stride,
+            snapshot_base + 2 * snapshot_stride,
+            snapshot_base + 3 * snapshot_stride,
+        };
+        unsigned * flags = comm_ctx->p2p_host_flags_dev[rank];
+        if (qwen4exp) {
+            ggml_cuda_rdna2_p2p_host_snapshot_reduce_2560<<<1, 1024, 0, ctx->stream()>>>(
+                static_cast<float *>(tensors[rank]->data), const_cast<float *>(snapshots[rank]),
+                snapshots[0], snapshots[1], snapshots[2], snapshots[3], rank,
+                flags, token);
+        } else if (mtp6) {
+            ggml_cuda_rdna2_p2p_host_snapshot_reduce_dflash6_30720<<<1, 1024, 0, ctx->stream()>>>(
+                static_cast<float *>(tensors[rank]->data), const_cast<float *>(snapshots[rank]),
+                snapshots[0], snapshots[1], snapshots[2], snapshots[3], rank,
+                flags, token);
+        } else if (mtp5) {
+            ggml_cuda_rdna2_p2p_host_snapshot_reduce_mtp5_25600<<<1, 1024, 0, ctx->stream()>>>(
+                static_cast<float *>(tensors[rank]->data), const_cast<float *>(snapshots[rank]),
+                snapshots[0], snapshots[1], snapshots[2], snapshots[3], rank,
+                flags, token);
+        } else {
+            ggml_cuda_rdna2_p2p_host_snapshot_reduce_5120<<<1, 1024, 0, ctx->stream()>>>(
+                static_cast<float *>(tensors[rank]->data), const_cast<float *>(snapshots[rank]),
+                snapshots[0], snapshots[1], snapshots[2], snapshots[3], rank,
+                flags, token);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+    ++comm_ctx->p2p_host_calls;
+    if (qwen4exp) {
+        if (!comm_ctx->p2p_host_logged_2560) {
+            comm_ctx->p2p_host_logged_2560 = true;
+            std::fprintf(stderr, "using RDNA2 P2P host-snapshot AllReduce for %s [2560,1,1,1] F32\n",
+                    tensors[0]->name);
+        }
+    } else {
+        const uint32_t bit = ggml_cuda_rdna2_p2p_host_width_bit(mtp5 ? 5 : mtp6 ? 6 : 1);
+        if ((comm_ctx->p2p_host_logged_widths & bit) == 0) {
+            comm_ctx->p2p_host_logged_widths |= bit;
+            std::fprintf(stderr, "using RDNA2 P2P host-snapshot AllReduce for %s [5120,%d,1,1] F32\n",
+                    tensors[0]->name, mtp5 ? 5 : mtp6 ? 6 : 1);
+        }
+    }
+    return true;
+}
+
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
 // tensors (bandwidth-bound), then converts back to FP32.
 static bool ggml_backend_cuda_comm_allreduce_nccl(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     const int64_t ne = ggml_nelements(tensors[0]);
+    const bool audit_enabled = !comm_ctx->rdna2_bf16_hidden_audit_path.empty();
+    if (audit_enabled) {
+        ggml_cuda_audit_record_call(comm_ctx->audit, ne == 0);
+    }
+
     // FIXME the input of llm_graph_context::build_in_out_ids can produce a tensor with 0 elements if n_outputs == 0
     // This then causes a crash in this function
     if (ne == 0) {
@@ -1068,16 +2589,92 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     }
 
     const size_t n_backends = comm_ctx->backends.size();
+    GGML_ASSERT(n_backends <= GGML_CUDA_MAX_DEVICES);
+    bool all_f32        = true;
+    bool all_contiguous = true;
+    bool all_same_shape = true;
+    std::array<uint32_t, GGML_CUDA_MAX_DEVICES> tensor_flags{};
 
     for (size_t i = 0; i < n_backends; ++i) {
         GGML_ASSERT(tensors[i] != nullptr);
         GGML_ASSERT(ggml_nelements(tensors[i]) == ne);
-        GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
+
+        all_f32        = all_f32 && tensors[i]->type == GGML_TYPE_F32;
+        all_contiguous = all_contiguous && ggml_is_contiguously_allocated(tensors[i]);
+        tensor_flags[i] = tensors[i]->flags;
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            all_same_shape = all_same_shape && tensors[i]->ne[dim] == tensors[0]->ne[dim];
+        }
+    }
+    GGML_ASSERT(all_contiguous);
+    const bool force_fp32 = ggml_cuda_any_allreduce_force_flag(
+        tensor_flags.data(), n_backends, GGML_TENSOR_FLAG_FORCE_FP32_ALLREDUCE);
+
+    ggml_cuda_allreduce_precision_input precision_input;
+    precision_input.candidate_enabled  = comm_ctx->rdna2_bf16_hidden_enabled;
+    precision_input.candidate_topology = comm_ctx->rdna2_bf16_hidden_topology;
+    precision_input.all_f32            = all_f32;
+    precision_input.all_contiguous     = all_contiguous;
+    precision_input.all_same_shape     = all_same_shape;
+    precision_input.force_fp32         = force_fp32;
+    precision_input.n_backends         = n_backends;
+    precision_input.nelements          = ne;
+    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+        precision_input.ne[dim] = tensors[0]->ne[dim];
     }
 
-    // For small tensors, simply reduce them as FP32.
-    // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
+    const bool candidate_eligible = ggml_cuda_is_rdna2_bf16_hidden_shape(precision_input);
+    const ggml_cuda_allreduce_precision precision = ggml_cuda_select_allreduce_precision(precision_input);
+
+    if (audit_enabled && ne == 4096) {
+        ++comm_ctx->audit_ne4096_calls;
+        comm_ctx->audit_ne4096_all_f32_calls += all_f32;
+        comm_ctx->audit_ne4096_same_shape_calls += all_same_shape;
+        if (!comm_ctx->audit_first_ne4096_recorded) {
+            for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                comm_ctx->audit_first_ne4096_shape[dim] = tensors[0]->ne[dim];
+            }
+            comm_ctx->audit_first_ne4096_recorded = true;
+        }
+    }
+    if (audit_enabled) {
+        ggml_cuda_audit_record_decision(
+            comm_ctx->audit, candidate_eligible, comm_ctx->rdna2_bf16_hidden_enabled, force_fp32, precision);
+    }
+
+    if (comm_ctx->rdna2_bf16_hidden_enabled && ne == 4096 &&
+            precision != ggml_cuda_allreduce_precision::candidate_bf16 &&
+            !comm_ctx->rdna2_bf16_hidden_miss_logged) {
+        std::fprintf(stderr,
+                "guarded RDNA2 BF16 hidden AllReduce guard miss: ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+                "] backends=%zu all_f32=%d contiguous=%d same_shape=%d force_fp32=%d\n",
+                tensors[0]->ne[0], tensors[0]->ne[1], tensors[0]->ne[2], tensors[0]->ne[3], n_backends,
+                all_f32, all_contiguous, all_same_shape, force_fp32);
+        comm_ctx->rdna2_bf16_hidden_miss_logged = true;
+    }
+    if (precision == ggml_cuda_allreduce_precision::candidate_bf16 && !comm_ctx->rdna2_bf16_hidden_logged) {
+        std::fprintf(stderr,
+                "using guarded RDNA2 BF16 hidden AllReduce: ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+                "] backends=%zu force_fp32=0\n",
+                tensors[0]->ne[0], tensors[0]->ne[1], tensors[0]->ne[2], tensors[0]->ne[3], n_backends);
+        comm_ctx->rdna2_bf16_hidden_logged = true;
+    }
+
+#if defined(GGML_USE_HIP) && defined(__linux__) && defined(GGML_USE_NCCL)
+    if (ggml_backend_cuda_comm_allreduce_rdna3_p2p(comm_ctx, tensors)) {
+        return true;
+    }
+#endif
+    if (ggml_cuda_rdna2_p2p_host_allreduce_enabled() &&
+            ggml_backend_cuda_comm_allreduce_rdna2_p2p_host(comm_ctx, tensors)) {
+        return true;
+    }
+
+    // For small tensors, simply reduce them as FP32. Output logits can also
+    // require FP32 explicitly because reduced-precision accumulation can alter
+    // close token rankings. The candidate only changes the exact guarded shape.
+    if (precision == ggml_cuda_allreduce_precision::forced_fp32 ||
+            precision == ggml_cuda_allreduce_precision::legacy_fp32) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -1211,6 +2808,170 @@ static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
     delete static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
 }
 
+static bool ggml_backend_cuda_comm_is_four_distinct_rdna2(
+        const ggml_backend_cuda_comm_context * comm_ctx) {
+#ifdef GGML_USE_HIP
+    if (comm_ctx->dev_ids.size() != 4) {
+        return false;
+    }
+
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    std::array<ggml_cuda_allreduce_topology_device, 4> devices{};
+    for (size_t i = 0; i < comm_ctx->dev_ids.size(); ++i) {
+        const int dev_id = comm_ctx->dev_ids[i];
+        if (dev_id < 0 || dev_id >= info.device_count) {
+            return false;
+        }
+        const auto & device = info.devices[dev_id];
+        devices[i] = { dev_id, device.physical_device, device.physical_share_count,
+            GGML_CUDA_CC_IS_RDNA2(device.cc) };
+    }
+    return ggml_cuda_is_four_distinct_rdna2_topology(
+        devices.data(), devices.size(), info.device_count, info.physical_device_count);
+#else
+    GGML_UNUSED(comm_ctx);
+    return false;
+#endif // GGML_USE_HIP
+}
+
+static bool ggml_cuda_rdna2_certified_v620_topology(
+        const ggml_backend_cuda_comm_context * comm_ctx) {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (!ggml_backend_cuda_comm_is_four_distinct_rdna2(comm_ctx)) {
+        return false;
+    }
+
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    for (int dev_id : comm_ctx->dev_ids) {
+        cudaDeviceProp prop{};
+        const int physical = info.devices[dev_id].physical_device;
+        if (cudaGetDeviceProperties(&prop, physical) != cudaSuccess ||
+                std::strncmp(prop.name, "AMD Radeon Pro V620", 20) != 0 ||
+                std::strncmp(prop.gcnArchName, "gfx1030", 7) != 0) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+    for (size_t i = 0; i < comm_ctx->dev_ids.size(); ++i) {
+        const int src = info.devices[comm_ctx->dev_ids[i]].physical_device;
+        for (size_t j = 0; j < comm_ctx->dev_ids.size(); ++j) {
+            if (i == j) {
+                continue;
+            }
+            const int dst = info.devices[comm_ctx->dev_ids[j]].physical_device;
+            int can_access = 0;
+            unsigned link_type = 0;
+            unsigned hop_count = 0;
+            if (cudaDeviceCanAccessPeer(&can_access, src, dst) != cudaSuccess || !can_access ||
+                    hipExtGetLinkTypeAndHopCount(src, dst, &link_type, &hop_count) != hipSuccess ||
+                    link_type != 2 || hop_count != 2) {
+                (void) cudaGetLastError();
+                return false;
+            }
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED(comm_ctx);
+    return false;
+#endif
+}
+
+static bool ggml_cuda_env_is_set(const char * name) {
+    return std::getenv(name) != nullptr;
+}
+
+static void ggml_cuda_prepare_native_rccl_policy(ggml_backend_cuda_comm_context * comm_ctx) {
+#if defined(GGML_USE_HIP) && defined(GGML_USE_NCCL) && defined(__linux__)
+    if (!ggml_cuda_rdna2_auto_enabled()) {
+        GGML_LOG_INFO("native RDNA2 Auto disabled by GGML_HIP_RDNA2_AUTO\n");
+        return;
+    }
+    const char * mode_env = std::getenv("GGML_HIP_RCCL_TUNE");
+    const bool force = mode_env != nullptr && std::strcmp(mode_env, "force") == 0;
+    const bool automatic = mode_env == nullptr || std::strcmp(mode_env, "auto") == 0;
+    if (!force && !automatic) {
+        if (mode_env != nullptr && std::strcmp(mode_env, "off") != 0) {
+            GGML_LOG_WARN("native RCCL tuner: invalid GGML_HIP_RCCL_TUNE=%s; using RCCL Auto\n", mode_env);
+        }
+        return;
+    }
+
+    static constexpr const char * policy_overrides[] = {
+        "NCCL_ALGO", "NCCL_PROTO", "NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS", "NCCL_NTHREADS",
+    };
+    for (const char * name : policy_overrides) {
+        if (ggml_cuda_env_is_set(name)) {
+            GGML_LOG_INFO("native RCCL tuner: %s is user-set; using user policy/RCCL Auto\n", name);
+            return;
+        }
+    }
+    if (const char * p2p_disable = std::getenv("NCCL_P2P_DISABLE");
+            p2p_disable != nullptr && std::strcmp(p2p_disable, "0") != 0) {
+        GGML_LOG_INFO("native RCCL tuner: NCCL_P2P_DISABLE=%s; preserving disabled P2P and RCCL Auto\n", p2p_disable);
+        return;
+    }
+    if (ggml_cuda_env_is_set("NCCL_TUNER_PLUGIN")) {
+        GGML_LOG_INFO("native RCCL tuner: NCCL_TUNER_PLUGIN is user-set; preserving it\n");
+        return;
+    }
+
+    int rccl_version = 0;
+    if (ncclGetVersion(&rccl_version) != ncclSuccess || rccl_version < 23004 || rccl_version >= 30000) {
+        GGML_LOG_INFO("native RCCL tuner: RCCL version %d does not provide the supported v6 policy ABI; using RCCL Auto\n",
+                rccl_version);
+        return;
+    }
+
+    Dl_info dl_info{};
+    if (dladdr(reinterpret_cast<const void *>(&ggml_cuda_prepare_native_rccl_policy), &dl_info) == 0 ||
+            dl_info.dli_fname == nullptr) {
+        GGML_LOG_WARN("native RCCL tuner: cannot locate libggml-hip; using RCCL Auto\n");
+        return;
+    }
+    const std::filesystem::path plugin = std::filesystem::path(dl_info.dli_fname).parent_path() /
+        "libnccl-tuner-rdna2-v620.so";
+    if (!std::filesystem::is_regular_file(plugin)) {
+        GGML_LOG_INFO("native RCCL tuner: packaged plugin not found at %s; using RCCL Auto\n", plugin.c_str());
+        return;
+    }
+
+    if (automatic && !ggml_cuda_rdna2_certified_v620_topology(comm_ctx)) {
+        GGML_LOG_INFO("native RCCL tuner: no certified policy for TP%zu/topology; using RCCL Auto\n",
+                comm_ctx->dev_ids.size());
+        return;
+    }
+
+    comm_ctx->native_rccl_policy_active = true;
+    comm_ctx->native_rccl_mode_owned = mode_env == nullptr;
+    comm_ctx->native_rccl_plugin_owned = true;
+    setenv("GGML_HIP_RCCL_TUNE", force ? "force" : "auto", 1);
+    setenv("NCCL_TUNER_PLUGIN", plugin.c_str(), 1);
+    if (!ggml_cuda_env_is_set("NCCL_P2P_LEVEL") &&
+            ggml_cuda_rdna2_certified_v620_topology(comm_ctx)) {
+        setenv("NCCL_P2P_LEVEL", "PXB", 1);
+        comm_ctx->native_rccl_p2p_level_owned = true;
+        GGML_LOG_INFO("native RCCL tuner: selected P2P level PXB for certified four-V620 PCIe-hop2 topology\n");
+    }
+    GGML_LOG_INFO("native RCCL tuner: %s policy selected for TP%zu before communicator initialization\n",
+            force ? "force" : "auto", comm_ctx->dev_ids.size());
+#else
+    GGML_UNUSED(comm_ctx);
+#endif
+}
+
+static void ggml_backend_cuda_comm_log_rdna2_bf16_topology(
+        const ggml_backend_cuda_comm_context * comm_ctx) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    std::fprintf(stderr, "guarded RDNA2 BF16 hidden AllReduce armed across %zu devices\n", comm_ctx->dev_ids.size());
+    for (size_t rank = 0; rank < comm_ctx->dev_ids.size(); ++rank) {
+        const int dev_id = comm_ctx->dev_ids[rank];
+        const auto & device = info.devices[dev_id];
+        std::fprintf(stderr, "  rank %zu: logical=%d physical=%d cc=%d share_count=%d\n",
+                rank, dev_id, device.physical_device, device.cc, device.physical_share_count);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Init -- chained nccl -> internal -> none.  Each step tries to bring up its
 // resource; on failure it warns and recurses into the next step.
@@ -1223,6 +2984,7 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
     ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
     if (ret->ar_pipeline) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
+        GGML_LOG_INFO("using internal AllReduce across %zu devices\n", ret->dev_ids.size());
         return;
     }
 
@@ -1233,26 +2995,209 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
     ggml_backend_cuda_comm_init_none(ret);
 }
 
+static std::mutex ggml_cuda_native_rccl_init_mutex;
+
 static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
 #ifdef GGML_USE_NCCL
     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
     const ggml_cuda_device_info & info = ggml_cuda_info();
     if (info.device_count > info.physical_device_count) {
+        if (ret->rdna2_bf16_hidden_enabled) {
+            GGML_ABORT("guarded RDNA2 BF16 hidden AllReduce requires four distinct physical NCCL/RCCL devices");
+        }
         GGML_LOG_WARN("NCCL disabled: virtual devices in use; "
                       "falling back to internal AllReduce\n");
         ggml_backend_cuda_comm_init_internal(ret);
         return;
     }
 
+    std::lock_guard<std::mutex> native_policy_lock(ggml_cuda_native_rccl_init_mutex);
+    ggml_cuda_prepare_native_rccl_policy(ret);
+
     const size_t n = ret->dev_ids.size();
-    ret->comms.resize(n);
+    ret->comms.assign(n, nullptr);
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
+    if (ret->native_rccl_plugin_owned) {
+        unsetenv("NCCL_TUNER_PLUGIN");
+    }
+    if (ret->native_rccl_mode_owned) {
+        unsetenv("GGML_HIP_RCCL_TUNE");
+    }
+    if (ret->native_rccl_p2p_level_owned) {
+        unsetenv("NCCL_P2P_LEVEL");
+    }
+    if (rc != ncclSuccess && ret->native_rccl_policy_active) {
+        GGML_LOG_WARN("native RCCL tuner initialization failed (%s); retrying with RCCL Auto\n",
+                ncclGetErrorString(rc));
+        for (ncclComm_t comm : ret->comms) {
+            if (comm != nullptr) {
+                (void) ncclCommAbort(comm);
+            }
+        }
+        ret->comms.assign(n, nullptr);
+        ret->native_rccl_policy_active = false;
+        rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
+    }
     if (rc == ncclSuccess) {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+        // The two-rank candidate decides between the architecture Auto policy,
+        // an explicit supervised override, and RCCL fallback after inspecting
+        // the selected topology.
+        (void) ggml_cuda_rdna3_p2p_init(ret);
+#endif
+        if (ggml_cuda_rdna2_p2p_host_allreduce_enabled()) {
+            bool canonical_order = n == 4;
+            for (size_t i = 0; canonical_order && i < n; ++i) {
+                canonical_order = ret->dev_ids[i] == int(i);
+            }
+            const char * tune_mode = std::getenv("GGML_HIP_RCCL_TUNE");
+            const char * tuner_plugin = std::getenv("NCCL_TUNER_PLUGIN");
+            int rccl_version = 0;
+            const bool supported_rccl = ncclGetVersion(&rccl_version) == ncclSuccess &&
+                rccl_version >= 23004 && rccl_version < 30000;
+            const bool explicit_narrow_policy = tune_mode != nullptr &&
+                (std::strcmp(tune_mode, "auto") == 0 || std::strcmp(tune_mode, "force") == 0) &&
+                tuner_plugin != nullptr && std::strstr(tuner_plugin, "rdna2-v620") != nullptr;
+            const bool narrow_v620_policy = supported_rccl &&
+                (ret->native_rccl_policy_active || explicit_narrow_policy) &&
+                std::getenv("NCCL_ALGO") == nullptr && std::getenv("NCCL_PROTO") == nullptr &&
+                std::getenv("NCCL_MIN_NCHANNELS") == nullptr && std::getenv("NCCL_MAX_NCHANNELS") == nullptr &&
+                std::getenv("NCCL_NTHREADS") == nullptr;
+            bool p2p_ok = ret->rdna2_bf16_hidden_topology && canonical_order && narrow_v620_policy &&
+                ggml_cuda_rdna2_certified_v620_topology(ret);
+            if (!p2p_ok) {
+                GGML_LOG_INFO("RDNA2 P2P host-snapshot AllReduce unavailable for this topology/policy; using RCCL\n");
+            }
+#ifdef GGML_USE_HIP
+            for (size_t i = 0; p2p_ok && i < n; ++i) {
+                ggml_cuda_set_device(ret->dev_ids[i]);
+                for (size_t j = 0; j < n; ++j) {
+                    if (i == j) {
+                        continue;
+                    }
+                    int can_access = 0;
+                    const cudaError_t access_rc = cudaDeviceCanAccessPeer(
+                        &can_access, ret->dev_ids[i], ret->dev_ids[j]);
+                    if (access_rc != cudaSuccess || !can_access) {
+                        GGML_LOG_WARN("RDNA2 P2P host-snapshot peer check failed for rank %zu -> %zu; using RCCL\n", i, j);
+                        p2p_ok = false;
+                        break;
+                    }
+                    const cudaError_t peer_rc = cudaDeviceEnablePeerAccess(ret->dev_ids[j], 0);
+                    if (peer_rc == cudaErrorPeerAccessAlreadyEnabled) {
+                        (void) cudaGetLastError();
+                    } else if (peer_rc != cudaSuccess) {
+                        GGML_LOG_WARN("RDNA2 P2P host-snapshot peer enable failed for rank %zu -> %zu: %s; using RCCL\n",
+                                i, j, cudaGetErrorString(peer_rc));
+                        (void) cudaGetLastError();
+                        p2p_ok = false;
+                        break;
+                    }
+                }
+            }
+            if (p2p_ok) {
+                ggml_cuda_set_device(ret->dev_ids[0]);
+                hipError_t alloc_rc = hipHostMalloc((void **) &ret->p2p_host_flags_host,
+                    4 * GGML_CUDA_RDNA2_P2P_FLAG_STRIDE * sizeof(unsigned),
+                    hipHostMallocPortable | hipHostMallocMapped | hipHostMallocCoherent);
+                if (alloc_rc == hipSuccess) {
+                    std::memset(ret->p2p_host_flags_host, 0,
+                        4 * GGML_CUDA_RDNA2_P2P_FLAG_STRIDE * sizeof(unsigned));
+                    for (int rank = 0; rank < 4 && alloc_rc == hipSuccess; ++rank) {
+                        ggml_cuda_set_device(ret->dev_ids[rank]);
+                        alloc_rc = hipHostGetDevicePointer(
+                            (void **) &ret->p2p_host_flags_dev[rank], ret->p2p_host_flags_host, 0);
+                        if (alloc_rc == hipSuccess && ret->p2p_host_flags_dev[rank] == nullptr) {
+                            alloc_rc = hipErrorInvalidValue;
+                        }
+                    }
+                }
+                if (alloc_rc == hipSuccess) {
+                    ggml_cuda_set_device(ret->dev_ids[0]);
+                    alloc_rc = hipHostMalloc((void **) &ret->p2p_host_snapshots_host,
+                        GGML_CUDA_RDNA2_P2P_SNAPSHOT_SLOTS * 4 *
+                            GGML_CUDA_RDNA2_P2P_SNAPSHOT_STRIDE * sizeof(float),
+                        hipHostMallocPortable | hipHostMallocMapped | hipHostMallocCoherent);
+                }
+                if (alloc_rc == hipSuccess) {
+                    std::memset(ret->p2p_host_snapshots_host, 0,
+                        GGML_CUDA_RDNA2_P2P_SNAPSHOT_SLOTS * 4 *
+                            GGML_CUDA_RDNA2_P2P_SNAPSHOT_STRIDE * sizeof(float));
+                    for (int rank = 0; rank < 4 && alloc_rc == hipSuccess; ++rank) {
+                        ggml_cuda_set_device(ret->dev_ids[rank]);
+                        alloc_rc = hipHostGetDevicePointer(
+                            (void **) &ret->p2p_host_snapshots_dev[rank], ret->p2p_host_snapshots_host, 0);
+                        if (alloc_rc == hipSuccess && ret->p2p_host_snapshots_dev[rank] == nullptr) {
+                            alloc_rc = hipErrorInvalidValue;
+                        }
+                    }
+                }
+                if (alloc_rc != hipSuccess) {
+                    GGML_LOG_WARN("RDNA2 P2P host-snapshot mapped allocation failed: %s; using RCCL\n",
+                            hipGetErrorString(alloc_rc));
+                    (void) hipGetLastError();
+                    p2p_ok = false;
+                }
+            }
+            if (!p2p_ok) {
+                if (ret->p2p_host_snapshots_host != nullptr) {
+                    (void) hipHostFree(ret->p2p_host_snapshots_host);
+                }
+                if (ret->p2p_host_flags_host != nullptr) {
+                    (void) hipHostFree(ret->p2p_host_flags_host);
+                }
+                ret->p2p_host_snapshots_host = nullptr;
+                ret->p2p_host_snapshots_dev.fill(nullptr);
+                ret->p2p_host_flags_host = nullptr;
+                ret->p2p_host_flags_dev.fill(nullptr);
+            } else {
+                ret->p2p_host_exact_2560 = ggml_cuda_rdna2_p2p_runtime_selftest(ret, 2560);
+                ret->p2p_host_exact_5120 = ggml_cuda_rdna2_p2p_runtime_selftest(ret, 5120);
+                ret->p2p_host_exact_25600 = ggml_cuda_rdna2_p2p_runtime_selftest(ret, 25600);
+                ret->p2p_host_exact_30720 = ggml_cuda_rdna2_p2p_runtime_selftest(ret, 30720);
+                if (!ret->p2p_host_exact_2560 && !ret->p2p_host_exact_5120 &&
+                        !ret->p2p_host_exact_25600 && !ret->p2p_host_exact_30720) {
+                    CUDA_CHECK(hipHostFree(ret->p2p_host_snapshots_host));
+                    CUDA_CHECK(hipHostFree(ret->p2p_host_flags_host));
+                    ret->p2p_host_snapshots_host = nullptr;
+                    ret->p2p_host_snapshots_dev.fill(nullptr);
+                    ret->p2p_host_flags_host = nullptr;
+                    ret->p2p_host_flags_dev.fill(nullptr);
+                    GGML_LOG_INFO("RDNA2 P2P host-snapshot schedules did not match installed RCCL; using RCCL\n");
+                } else {
+                    ret->p2p_host_initialized = true;
+                    const int p2p_mode = ggml_cuda_rdna2_p2p_host_allreduce_mode();
+                    std::fprintf(stderr, "armed RDNA2 P2P %s host-snapshot AllReduce after installed-RCCL self-test (qwen4=%d n1=%d n5=%d n6=%d)\n",
+                            p2p_mode == GGML_CUDA_RDNA2_P2P_HOST_FUSED ? "consumer-fused" :
+                            p2p_mode == GGML_CUDA_RDNA2_P2P_HOST_AUTO_EXPANDED ? "spec-target-rows5-auto-expanded" :
+                            ggml_cuda_rdna2_p2p_host_allreduce_mtp_enabled() ? "spec-target-rows5-auto" : "ordinary",
+                            ret->p2p_host_exact_2560 ? 1 : 0, ret->p2p_host_exact_5120 ? 1 : 0,
+                            ret->p2p_host_exact_25600 ? 1 : 0, ret->p2p_host_exact_30720 ? 1 : 0);
+                }
+            }
+#else
+            GGML_LOG_WARN("RDNA2 P2P host-snapshot AllReduce is HIP-only; using RCCL\n");
+#endif
+        }
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+        GGML_LOG_INFO("using RCCL/NCCL AllReduce across %zu devices\n", n);
         return;
     }
 
+    for (ncclComm_t comm : ret->comms) {
+        if (comm == nullptr) {
+            continue;
+        }
+        const ncclResult_t cleanup_rc = ncclCommAbort(comm);
+        if (cleanup_rc != ncclSuccess) {
+            GGML_LOG_WARN("NCCL partial communicator cleanup failed: %s\n", ncclGetErrorString(cleanup_rc));
+        }
+    }
     ret->comms.clear();
+    if (ret->rdna2_bf16_hidden_enabled) {
+        GGML_ABORT("guarded RDNA2 BF16 hidden AllReduce NCCL/RCCL initialization failed: %s",
+                ncclGetErrorString(rc));
+    }
     GGML_LOG_WARN("NCCL init failed (%s); falling back to internal AllReduce\n",
                   ncclGetErrorString(rc));
 #else // GGML_USE_NCCL
@@ -1276,14 +3221,73 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         }
     }
 
+    const char * candidate_env = std::getenv("GGML_HIP_RDNA2_BF16_HIDDEN_ALLREDUCE");
+    const ggml_cuda_rdna2_bf16_hidden_option candidate_option =
+        ggml_cuda_parse_rdna2_bf16_hidden_option(candidate_env);
+
+    const char * audit_env = std::getenv("GGML_HIP_RDNA2_BF16_HIDDEN_ALLREDUCE_AUDIT");
+    if (audit_env != nullptr && audit_env[0] == '\0') {
+        GGML_ABORT("GGML_HIP_RDNA2_BF16_HIDDEN_ALLREDUCE_AUDIT must be unset or a nonempty path");
+    }
+
     auto * ret = new ggml_backend_cuda_comm_context;
     ret->backends.assign(backends, backends + n_backends);
     ret->dev_ids.reserve(n_backends);
     for (size_t i = 0; i < n_backends; i++) {
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
     }
+    ret->rdna2_bf16_hidden_topology = ggml_backend_cuda_comm_is_four_distinct_rdna2(ret);
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (ggml_cuda_rdna3_auto_active) {
+        const char * allreduce = std::getenv("GGML_CUDA_ALLREDUCE");
+        const char * p2p = std::getenv("GGML_CUDA_P2P");
+        const char * p2p_disable = std::getenv("NCCL_P2P_DISABLE");
+        GGML_LOG_INFO("native RDNA3 Auto active: GGML_CUDA_ALLREDUCE=%s GGML_CUDA_P2P=%s "
+            "NCCL_P2P_DISABLE=%s; NCCL level/algorithm/protocol remain on Auto\n",
+            allreduce != nullptr ? allreduce : "<unset>",
+            p2p != nullptr ? p2p : "<unset>",
+            p2p_disable != nullptr ? p2p_disable : "<unset>");
+    }
+#endif
+    if (audit_env != nullptr) {
+        ret->rdna2_bf16_hidden_audit_path = audit_env;
+        ret->audit_context_id = ggml_cuda_rdna2_bf16_hidden_audit_next_context.fetch_add(1);
+    }
 
-    const char * env = getenv("GGML_CUDA_ALLREDUCE");
+    const char * env = std::getenv("GGML_CUDA_ALLREDUCE");
+#if defined(GGML_USE_HIP)
+    constexpr bool hip_compiled = true;
+#else
+    constexpr bool hip_compiled = false;
+#endif
+#if defined(GGML_USE_NCCL)
+    constexpr bool nccl_compiled = true;
+#else
+    constexpr bool nccl_compiled = false;
+#endif
+    const ggml_cuda_rdna2_bf16_hidden_activation activation =
+        ggml_cuda_validate_rdna2_bf16_hidden_activation(
+            candidate_option, hip_compiled, nccl_compiled, env, ret->rdna2_bf16_hidden_topology);
+    switch (activation) {
+        case ggml_cuda_rdna2_bf16_hidden_activation::disabled:
+            break;
+        case ggml_cuda_rdna2_bf16_hidden_activation::enabled:
+            ret->rdna2_bf16_hidden_enabled = true;
+            ggml_backend_cuda_comm_log_rdna2_bf16_topology(ret);
+            break;
+        case ggml_cuda_rdna2_bf16_hidden_activation::invalid_option:
+            GGML_ABORT("invalid GGML_HIP_RDNA2_BF16_HIDDEN_ALLREDUCE value: '%s' (expected unset, 0, or 1)",
+                    candidate_env == nullptr ? "<unset>" : candidate_env);
+        case ggml_cuda_rdna2_bf16_hidden_activation::requires_hip:
+            GGML_ABORT("GGML_HIP_RDNA2_BF16_HIDDEN_ALLREDUCE=1 requires a HIP build");
+        case ggml_cuda_rdna2_bf16_hidden_activation::requires_nccl:
+            GGML_ABORT("GGML_HIP_RDNA2_BF16_HIDDEN_ALLREDUCE=1 requires RCCL/NCCL support");
+        case ggml_cuda_rdna2_bf16_hidden_activation::requires_explicit_nccl:
+            GGML_ABORT("GGML_HIP_RDNA2_BF16_HIDDEN_ALLREDUCE=1 requires GGML_CUDA_ALLREDUCE=nccl");
+        case ggml_cuda_rdna2_bf16_hidden_activation::requires_four_distinct_rdna2:
+            GGML_ABORT("GGML_HIP_RDNA2_BF16_HIDDEN_ALLREDUCE=1 requires exactly four distinct RDNA2 physical devices");
+    }
+
     if (!env) {
         // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
 #if defined(__linux__)
@@ -1310,6 +3314,19 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
 
 // Top-level dispatch -- calls the function pointer chosen by comm_init.
 // Returns false to let the meta-backend's butterfly run.
+static bool ggml_backend_cuda_comm_allreduce_fused_prefix(
+        void * comm_ctx_v, struct ggml_tensor ** tensors, struct ggml_tensor ** reshapes,
+        struct ggml_tensor ** adds, struct ggml_tensor ** rms_norms, struct ggml_tensor ** muls) {
+#ifdef GGML_USE_NCCL
+    return ggml_backend_cuda_comm_allreduce_rdna2_p2p_host_fused_prefix(
+        static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v), tensors, reshapes, adds, rms_norms, muls);
+#else
+    GGML_UNUSED(comm_ctx_v); GGML_UNUSED(tensors); GGML_UNUSED(reshapes);
+    GGML_UNUSED(adds); GGML_UNUSED(rms_norms); GGML_UNUSED(muls);
+    return false;
+#endif
+}
+
 static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
     if (comm_ctx_v == nullptr) {
         return false;
@@ -1992,7 +4009,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
+    if (ggml_cuda_op_dsv4_hc_mixes(ctx, src0, src1, dst, cc, warp_size)) {
+        return;
+    }
+
+    // Decode and small speculative verification batches must select the same
+    // vector kernel to preserve their accumulation order.
+    const int64_t ne11_mmvf = ne11 <= MMVF_MAX_BATCH_SIZE ? 1 : ne11;
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11_mmvf)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -2041,7 +4065,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0, dst->src[2], cc)) {
                 return false;
             }
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
@@ -2078,7 +4102,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0, ids, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
@@ -2142,7 +4166,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
                 }
             }
         }
@@ -3592,6 +5615,44 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
+    std::initializer_list<enum ggml_op> add_rms_norm_mul_ops = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+    if (is_equal(add_rms_norm_mul_ops, ops) &&
+            ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx, node_idx + 2 })) {
+        const ggml_tensor * add      = cgraph->nodes[node_idx];
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * weight   = mul->src[0] == rms_norm ? mul->src[1] :
+                                       mul->src[1] == rms_norm ? mul->src[0] : nullptr;
+
+        if (rms_norm->src[0] != add || weight == nullptr ||
+                add->type != GGML_TYPE_F32 || add->src[0]->type != GGML_TYPE_F32 ||
+                add->src[1]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+                weight->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+                !ggml_are_same_shape(add->src[0], add->src[1]) ||
+                !ggml_are_same_shape(add->src[0], add) ||
+                !ggml_are_same_shape(add, rms_norm) || !ggml_are_same_shape(rms_norm, mul) ||
+                weight->ne[0] != add->ne[0] || ggml_nelements(weight) != add->ne[0] ||
+                !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1]) ||
+                !ggml_is_contiguous(add) || !ggml_is_contiguous(weight) || !ggml_is_contiguous(mul) ||
+                add->ne[0] < 1024) {
+            return false;
+        }
+        // The Qwen decode graph reuses two equally sized activation buffers in a
+        // strict ping-pong pattern. The fused kernel reads both inputs and reaches
+        // a block barrier before writing the second output, so exact whole-buffer
+        // aliases in either direction are safe. Reject every other overlap/layout.
+        const bool ping_pong =
+            (add->data == add->src[0]->data && mul->data == add->src[1]->data) ||
+            (add->data == add->src[1]->data && mul->data == add->src[0]->data);
+        const uintptr_t a_begin = reinterpret_cast<uintptr_t>(add->src[0]->data);
+        const uintptr_t b_begin = reinterpret_cast<uintptr_t>(add->src[1]->data);
+        const size_t activation_bytes = ggml_nbytes(add);
+        const bool inputs_disjoint = a_begin + activation_bytes <= b_begin ||
+                                     b_begin + activation_bytes <= a_begin;
+        return ping_pong && inputs_disjoint &&
+               weight->data != add->src[0]->data && weight->data != add->src[1]->data;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -3769,6 +5830,74 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static bool ggml_cuda_use_gfx1030_q8_cache() {
+#if defined(GGML_USE_HIP)
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (GGML_CUDA_CC_IS_RDNA2(cc)) {
+        return ggml_cuda_rdna2_native_profile_enabled() &&
+               ggml_cuda_rdna2_feature_enabled("GGML_HIP_GFX1030_Q8_CACHE");
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+static bool ggml_cuda_use_gfx1030_q8_cache_telemetry() {
+#if defined(GGML_USE_HIP)
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (GGML_CUDA_CC_IS_RDNA2(cc)) {
+        const char * telemetry = std::getenv("GGML_HIP_GFX1030_Q8_CACHE_TELEMETRY");
+        return ggml_cuda_rdna2_native_profile_enabled() &&
+               telemetry != nullptr && std::atoi(telemetry) != 0;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+static bool ggml_cuda_use_gfx1030_q8_1_fusion() {
+#if defined(GGML_USE_HIP)
+    // Environment configuration is immutable after backend initialization;
+    // avoid repeated getenv/atoi work while traversing every graph.
+    static const bool enabled = []() {
+        return ggml_cuda_rdna2_native_profile_enabled() &&
+               ggml_cuda_rdna2_feature_enabled("GGML_HIP_GFX1030_Q8_1_FUSION");
+    }();
+    if (!enabled) {
+        return false;
+    }
+
+    const int device = ggml_cuda_get_device();
+    return GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[device].cc);
+#else
+    return false;
+#endif
+}
+
+static bool ggml_cuda_use_rdna_add_rms_norm_fusion() {
+#if defined(GGML_USE_HIP)
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (GGML_CUDA_CC_IS_RDNA2(cc)) {
+        return ggml_cuda_rdna2_feature_enabled("GGML_HIP_GFX1030_ADD_RMS_NORM_FUSION");
+    }
+    if (cc == GGML_CUDA_CC_RDNA3) {
+        static const bool enabled = [] {
+            const char * env = std::getenv("GGML_HIP_RDNA3_ADD_RMS_NORM_FUSION");
+            return env != nullptr && std::atoi(env) != 0;
+        }();
+        return enabled;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3798,6 +5927,154 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Qwen4Exp HyperConnection stream reduction:
+    // cont(stream 0) -> add(stream 1) -> add(stream 2) -> add(stream 3) -> scale(1/4).
+    if (node->op == GGML_OP_CONT && i + 7 < cgraph->n_nodes &&
+            ggml_cuda_use_qwen4exp_hc_reduce()) {
+        ggml_tensor * view0 = node->src[0];
+        ggml_tensor * view1 = cgraph->nodes[i + 1];
+        ggml_tensor * add1  = cgraph->nodes[i + 2];
+        ggml_tensor * view2 = cgraph->nodes[i + 3];
+        ggml_tensor * add2  = cgraph->nodes[i + 4];
+        ggml_tensor * view3 = cgraph->nodes[i + 5];
+        ggml_tensor * add3  = cgraph->nodes[i + 6];
+        ggml_tensor * scale = cgraph->nodes[i + 7];
+        float scale_value = 0.0f;
+        float scale_bias  = 0.0f;
+        std::memcpy(&scale_value, (const float *) scale->op_params + 0, sizeof(float));
+        std::memcpy(&scale_bias,  (const float *) scale->op_params + 1, sizeof(float));
+        const auto add_of = [](const ggml_tensor * add, const ggml_tensor * a, const ggml_tensor * b) {
+            return (add->src[0] == a && add->src[1] == b) ||
+                   (add->src[0] == b && add->src[1] == a);
+        };
+        ggml_tensor * streams = view0 != nullptr ? view0->view_src : nullptr;
+        const bool pattern_ok = view0 != nullptr && view0->op == GGML_OP_VIEW &&
+            view1->op == GGML_OP_VIEW && add1->op == GGML_OP_ADD &&
+            view2->op == GGML_OP_VIEW && add2->op == GGML_OP_ADD &&
+            view3->op == GGML_OP_VIEW && add3->op == GGML_OP_ADD && scale->op == GGML_OP_SCALE &&
+            streams != nullptr && view1->view_src == streams && view2->view_src == streams && view3->view_src == streams &&
+            view0->view_offs == 0 &&
+            view1->view_offs == 1 * view0->ne[0] * view0->nb[0] &&
+            view2->view_offs == 2 * view0->ne[0] * view0->nb[0] &&
+            view3->view_offs == 3 * view0->ne[0] * view0->nb[0] &&
+            add_of(add1, node, view1) && add_of(add2, add1, view2) && add_of(add3, add2, view3) &&
+            scale->src[0] == add3 && std::strncmp(scale->name, "hc_mixed-", sizeof("hc_mixed-") - 1) == 0 &&
+            scale_value == 0.25f && scale_bias == 0.0f;
+        // ggml_can_fuse_subgraph() deliberately rejects views of a non-constant external tensor.
+        // That is the tensor consumed by this fused kernel, so validate every skipped node directly.
+        bool graph_ok = pattern_ok && (scale->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        for (int k = 0; k < 7; ++k) {
+            const ggml_tensor * skipped_node = cgraph->nodes[i + k];
+            graph_ok = graph_ok && (skipped_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                (skipped_node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                ggml_node_get_use_count(cgraph, i + k) == 1;
+        }
+        const uintptr_t stream_begin = streams != nullptr ? (uintptr_t) streams->data : 0;
+        const uintptr_t stream_end = stream_begin + (streams != nullptr ? ggml_nbytes(streams) : 0);
+        const uintptr_t dst_begin = (uintptr_t) scale->data;
+        const uintptr_t dst_end = dst_begin + ggml_nbytes(scale);
+        const bool ranges_ok = graph_ok && !(stream_begin < dst_end && dst_begin < stream_end);
+        if (ranges_ok && ggml_cuda_op_qwen4exp_hc_reduce(*cuda_ctx, streams, scale)) {
+            return 7;
+        }
+    }
+
+    // Qwen4Exp low-rank HC activation: scale(1/4) -> SiLU.
+    if (node->op == GGML_OP_SCALE && i + 3 < cgraph->n_nodes &&
+            ggml_cuda_use_qwen4exp_hc_scale_silu()) {
+        ggml_tensor * silu = cgraph->nodes[i + 1];
+        ggml_tensor * up   = cgraph->nodes[i + 2];
+        ggml_tensor * gate = cgraph->nodes[i + 3];
+        const ggml_op ops[] = { GGML_OP_SCALE, GGML_OP_UNARY };
+        const int out_nodes[] = { i + 1 };
+        float scale_value = 0.0f;
+        float scale_bias  = 0.0f;
+        std::memcpy(&scale_value, (const float *) node->op_params + 0, sizeof(float));
+        std::memcpy(&scale_bias,  (const float *) node->op_params + 1, sizeof(float));
+        const bool pattern_ok = silu->op == GGML_OP_UNARY && up->op == GGML_OP_MUL_MAT &&
+            gate->op == GGML_OP_UNARY && silu->src[0] == node && up->src[1] == silu && gate->src[0] == up &&
+            ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+            ggml_get_unary_op(gate) == GGML_UNARY_OP_SIGMOID &&
+            std::strncmp(gate->name, "hc_gate-", sizeof("hc_gate-") - 1) == 0 &&
+            scale_value == 0.25f && scale_bias == 0.0f && node->src[0] != nullptr;
+        const bool graph_ok = pattern_ok && ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1);
+        const uintptr_t src_begin = node->src[0] != nullptr ? (uintptr_t) node->src[0]->data : 0;
+        const uintptr_t src_end = src_begin + (node->src[0] != nullptr ? ggml_nbytes(node->src[0]) : 0);
+        const uintptr_t dst_begin = (uintptr_t) silu->data;
+        const uintptr_t dst_end = dst_begin + ggml_nbytes(silu);
+        const bool ranges_ok = graph_ok &&
+            (src_begin == dst_begin || !(src_begin < dst_end && dst_begin < src_end));
+        if (ranges_ok && ggml_cuda_op_qwen4exp_hc_scale_silu(*cuda_ctx, node->src[0], silu)) {
+            return 1;
+        }
+    }
+
+    // Qwen4Exp HyperConnection combine:
+    // scale(1/4) -> sigmoid -> scale(2) -> reshape -> mul -> residual add.
+    // Keep the canonical graph and allocator plan; only backend execution is fused.
+    if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes &&
+            ggml_cuda_use_qwen4exp_hc_combine()) {
+        ggml_tensor * sigmoid = cgraph->nodes[i + 1];
+        ggml_tensor * scale2  = cgraph->nodes[i + 2];
+        ggml_tensor * reshape = cgraph->nodes[i + 3];
+        ggml_tensor * mul     = cgraph->nodes[i + 4];
+        ggml_tensor * add     = cgraph->nodes[i + 5];
+        const ggml_op ops[] = {
+            GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE,
+            GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ADD,
+        };
+        const int out_nodes[] = { i + 5 };
+
+        float scale1_value = 0.0f;
+        float scale1_bias  = 0.0f;
+        float scale2_value = 0.0f;
+        float scale2_bias  = 0.0f;
+        std::memcpy(&scale1_value, (const float *) node->op_params + 0, sizeof(float));
+        std::memcpy(&scale1_bias,  (const float *) node->op_params + 1, sizeof(float));
+        std::memcpy(&scale2_value, (const float *) scale2->op_params + 0, sizeof(float));
+        std::memcpy(&scale2_bias,  (const float *) scale2->op_params + 1, sizeof(float));
+
+        ggml_tensor * block_repeat = nullptr;
+        if (mul->src[0] == reshape) {
+            block_repeat = mul->src[1];
+        } else if (mul->src[1] == reshape) {
+            block_repeat = mul->src[0];
+        }
+        ggml_tensor * residual = nullptr;
+        if (add->src[0] == mul) {
+            residual = add->src[1];
+        } else if (add->src[1] == mul) {
+            residual = add->src[0];
+        }
+
+        const bool pattern_ok = sigmoid->op == GGML_OP_UNARY && scale2->op == GGML_OP_SCALE &&
+            reshape->op == GGML_OP_RESHAPE && mul->op == GGML_OP_MUL && add->op == GGML_OP_ADD &&
+            sigmoid->src[0] == node && ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
+            scale2->src[0] == sigmoid && reshape->src[0] == scale2 &&
+            block_repeat != nullptr && block_repeat->op == GGML_OP_REPEAT &&
+            residual != nullptr && node->src[0] != nullptr &&
+            std::strncmp(add->name, "hc_combine-", sizeof("hc_combine-") - 1) == 0 &&
+            scale1_value == 0.25f && scale1_bias == 0.0f &&
+            scale2_value == 2.0f && scale2_bias == 0.0f;
+
+        const bool graph_ok = pattern_ok && ggml_can_fuse_subgraph(cgraph, i, 6, ops, out_nodes, 1);
+        const bool generic_ranges_ok = graph_ok && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, out_nodes, 1);
+        const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+            const uintptr_t a0 = (uintptr_t) a->data;
+            const uintptr_t a1 = a0 + ggml_nbytes(a);
+            const uintptr_t b0 = (uintptr_t) b->data;
+            const uintptr_t b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        const bool safe_residual_inplace = graph_ok && add->data == residual->data &&
+            !overlaps(add, block_repeat) && !overlaps(add, node->src[0]);
+        const bool ranges_ok = generic_ranges_ok || safe_residual_inplace;
+        if (ranges_ok && ggml_cuda_op_qwen4exp_hc_combine(
+                *cuda_ctx, residual, block_repeat, node->src[0], add)) {
+            return 5;
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -3806,6 +6083,60 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
+            }
+        }
+    }
+
+    // Prototype: fuse SwiGLU evaluation into the Q8_1 quantization feeding the
+    // following down projection. This targets the PP/MMQ path first; the TG
+    // gate+up+GLU path is already fused in MMVQ and is deliberately untouched.
+    if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * down = cgraph->nodes[i + 1];
+
+        // Reject decode before consulting environment/device state or checking
+        // tensor layouts. Batches up to MMVQ_MAX_BATCH_SIZE keep the original
+        // MMVQ path and pay only these cheap graph-field comparisons.
+        const bool is_pp_mmid = down->op == GGML_OP_MUL_MAT_ID &&
+                                down->src[1] != nullptr &&
+                                down->src[1]->ne[2] > MMVQ_MAX_BATCH_SIZE;
+
+        if (is_pp_mmid && ggml_cuda_use_gfx1030_q8_1_fusion()) {
+            const bool is_swiglu = ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU;
+            const bool shape_ok = node->src[0] != nullptr && node->src[1] != nullptr &&
+                                  node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+                                  down->src[1] == node && down->src[1]->type == GGML_TYPE_F32 &&
+                                  down->type == GGML_TYPE_F32 && down->src[0] != nullptr &&
+                                  ggml_is_quantized(down->src[0]->type) &&
+                                  ggml_are_same_shape(node->src[0], node->src[1]) &&
+                                  node->src[0]->ne[0] == down->src[1]->ne[0] &&
+                                  node->src[0]->ne[0] % 4 == 0 &&
+                                  node->src[0]->ne[3] == 1 &&
+                                  node->src[0]->nb[1] % sizeof(float4) == 0 &&
+                                  node->src[0]->nb[2] % sizeof(float4) == 0 &&
+                                  node->src[1]->nb[1] % sizeof(float4) == 0 &&
+                                  node->src[1]->nb[2] % sizeof(float4) == 0 &&
+                                  ggml_cuda_is_aligned(node->src[0], sizeof(float4)) &&
+                                  ggml_cuda_is_aligned(node->src[1], sizeof(float4));
+            // The fused producer currently cannot reproduce the broadcast/dedup
+            // scatter layout used when src1->ne[1] == 1 and top_k > 1.
+            const bool routed_layout_ok = down->src[2] == nullptr ||
+                                          down->src[1]->ne[1] != 1 ||
+                                          down->src[2]->ne[0] <= 1;
+
+            if (is_swiglu && shape_ok && routed_layout_ok) {
+                const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+                const int64_t ncols = down->src[1]->ne[2];
+                const int64_t n_experts = down->src[0]->ne[2];
+                const bool mmq_ok = ggml_cuda_should_use_mmq(down->src[0]->type, cc, ncols, n_experts);
+                const ggml_op ops[] = { GGML_OP_GLU, down->op };
+                const int out_nodes[] = { i + 1 };
+
+                if (mmq_ok && ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1) &&
+                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+                    ggml_cuda_mul_mat_q(*cuda_ctx, down->src[0], down->src[1], down->src[2], down,
+                            node->src[0], node->src[1]);
+                    return 1;
+                }
             }
         }
     }
@@ -4508,6 +6839,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    if (ggml_cuda_use_rdna_add_rms_norm_fusion() &&
+            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+#if defined(GGML_USE_HIP)
+        const int device = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[device].cc;
+        if (cc == GGML_CUDA_CC_RDNA3) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "using gfx1100 ADD+RMS_NORM+MUL fusion\n");
+            }
+        }
+#endif
+        ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -4524,7 +6871,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        void * q8_cache = nullptr;
+#ifdef USE_CUDA_GRAPH
+        if (ggml_cuda_use_gfx1030_q8_cache()) {
+            const ggml_tensor * rms_src = node->src[0];
+            const ggml_tensor * mul_src = mul->src[0] == node ? mul->src[1] : mul->src[0];
+            const bool producer_ok = (mul->src[0] == node || mul->src[1] == node) &&
+                rms_src->type == GGML_TYPE_F32 && mul_src->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(rms_src) && ggml_is_contiguous(mul_src) && ggml_is_contiguous(mul) &&
+                rms_src->ne[1] == 1 && rms_src->ne[2] == 1 && rms_src->ne[3] == 1 &&
+                mul_src->ne[0] == rms_src->ne[0] && ggml_nelements(mul_src) == rms_src->ne[0] &&
+                ggml_are_same_shape(rms_src, mul) && rms_src->ne[0] >= 1024 &&
+                rms_src->ne[0] % 1024 == 0 && rms_src->ne[0] % QK8_1 == 0;
+            if (producer_ok) {
+                const size_t q8_bytes = rms_src->ne[0] / QK8_1 * sizeof(block_q8_1);
+                q8_cache = cuda_ctx->q8_cache_producer(
+                    mul, GGML_TYPE_Q8_0, rms_src->ne[0], q8_bytes);
+            }
+        }
+#endif
+        if (q8_cache != nullptr) {
+            ggml_cuda_op_rms_norm_fused_q8_1(*cuda_ctx, node, mul, q8_cache);
+        } else {
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul);
+        }
         return 1;
     }
 
@@ -4668,6 +7039,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+#ifdef USE_CUDA_GRAPH
+                cuda_ctx->active_node_index = i;
+#endif
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4707,7 +7081,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     continue;
                 }
-
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4818,6 +7191,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    const bool q8_cache_enabled = ggml_cuda_use_gfx1030_q8_cache();
+    const bool q8_cache_telemetry = q8_cache_enabled || ggml_cuda_use_gfx1030_q8_cache_telemetry();
+    if (q8_cache_telemetry) {
+        graph->q8_cache_telemetry_begin(q8_cache_enabled);
+        cuda_ctx->active_graph = graph;
+        cuda_ctx->active_cgraph = cgraph;
+        cuda_ctx->active_node_index = -1;
+    }
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
@@ -4862,6 +7243,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+#ifdef USE_CUDA_GRAPH
+    if (cuda_ctx->active_graph != nullptr) {
+        cuda_ctx->active_graph->q8_cache_telemetry_end(
+            cuda_ctx->device, ggml_cuda_use_gfx1030_q8_cache_telemetry());
+        cuda_ctx->active_graph = nullptr;
+        cuda_ctx->active_cgraph = nullptr;
+        cuda_ctx->active_node_index = -1;
+    }
+#endif
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5275,6 +7666,21 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return reinterpret_cast<void *>(cuda_ctx->stream());
+}
+
+int ggml_backend_cuda_get_device(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return -1;
+    }
+    return ((ggml_backend_cuda_context *) backend->context)->device;
+}
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -5313,8 +7719,23 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     *total /= share_count;
 }
 
+static bool ggml_cuda_should_register_host_buffer() {
+    if (ggml_cuda_register_host_enabled()) {
+        return true;
+    }
+
+#if defined(GGML_USE_HIP)
+    // Work around ROCm/rocm-systems#4817 for in-memory state transfers without
+    // enabling registration of unrelated host allocations on CUDA or MUSA.
+    const char * safe_state_io = getenv("GGML_HIP_SAFE_STATE_IO");
+    return safe_state_io != nullptr && atoi(safe_state_io) != 0;
+#else
+    return false;
+#endif
+}
+
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
-    if (!ggml_cuda_register_host_enabled()) {
+    if (!ggml_cuda_should_register_host_buffer()) {
         return false;
     }
 
@@ -5337,7 +7758,7 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 }
 
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
-    if (!ggml_cuda_register_host_enabled()) {
+    if (!ggml_cuda_should_register_host_buffer()) {
         return;
     }
 
@@ -6176,11 +8597,23 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
+    if (strcmp(name, "ggml_backend_comm_allreduce_fused_prefix") == 0) {
+        const int mode = ggml_cuda_rdna2_p2p_host_allreduce_mode();
+        return (mode == GGML_CUDA_RDNA2_P2P_HOST_FUSED ||
+                mode == GGML_CUDA_RDNA2_P2P_HOST_AUTO_EXPANDED) ?
+            (void *)ggml_backend_cuda_comm_allreduce_fused_prefix : nullptr;
+    }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_stream") == 0) {
+        return (void *)ggml_backend_cuda_get_stream;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_device") == 0) {
+        return (void *)ggml_backend_cuda_get_device;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

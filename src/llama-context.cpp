@@ -7,15 +7,18 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
-
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1105,13 +1108,118 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+void llama_context::materialize_device_outputs() {
+    for (const auto & copy : pending_embd_nextn_copies) {
+        if (copy.tensor != nullptr && copy.backend != nullptr && copy.dst != nullptr) {
+            ggml_backend_tensor_get(copy.tensor, copy.dst, 0, copy.size);
+        }
+    }
+    for (const auto & layer : pending_embd_layer_inp_copies) {
+        for (const auto & copy : layer) {
+            if (copy.tensor != nullptr && copy.backend != nullptr && copy.dst != nullptr) {
+                ggml_backend_tensor_get(copy.tensor, copy.dst, 0, copy.size);
+            }
+        }
+    }
+    pending_embd_nextn_copies.clear();
+    pending_embd_layer_inp_copies.clear();
+}
+
 float * llama_context::get_embeddings_nextn() {
+    materialize_device_outputs();
     output_reorder();
 
     return embd_nextn.data;
 }
 
+static bool llama_backend_get_hip_device_stream(
+        ggml_backend_t backend, int32_t & device, void * & stream) {
+    if (backend == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_t backend_device = ggml_backend_get_device(backend);
+    const char * name = backend_device != nullptr ? ggml_backend_dev_name(backend_device) : nullptr;
+    if (name == nullptr || std::strncmp(name, "ROCm", 4) != 0) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend_device);
+    if (reg == nullptr) {
+        return false;
+    }
+    using get_stream_fn = void * (*)(ggml_backend_t);
+    using get_device_fn = int (*)(ggml_backend_t);
+    auto get_stream = reinterpret_cast<get_stream_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_stream"));
+    auto get_device = reinterpret_cast<get_device_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_device"));
+    if (get_stream == nullptr || get_device == nullptr) {
+        return false;
+    }
+    stream = get_stream(backend);
+    device = get_device(backend);
+    return stream != nullptr && device >= 0;
+}
+
+static bool llama_backend_get_hip_device_tensor(
+        ggml_backend_t backend, const ggml_tensor * tensor,
+        ggml_backend_t & device_backend, const ggml_tensor * & device_tensor,
+        int32_t & device, void * & stream) {
+    device_backend = nullptr;
+    device_tensor  = nullptr;
+
+    if (tensor == nullptr) {
+        return false;
+    }
+    if (llama_backend_get_hip_device_stream(backend, device, stream)) {
+        device_backend = backend;
+        device_tensor  = tensor;
+        return tensor->data != nullptr;
+    }
+
+    // Tensor-parallel output uses a Meta backend. A mirrored hidden-state
+    // tensor has one complete physical copy per GPU; select the last copy to
+    // preserve the established sidecar placement on the final TP device.
+    for (size_t i = GGML_BACKEND_META_MAX_DEVICES; i-- > 0;) {
+        ggml_backend_t simple_backend = nullptr;
+        const ggml_tensor * simple_tensor = nullptr;
+        if (!ggml_backend_meta_get_mirrored_tensor(
+                    backend, tensor, i, &simple_backend, &simple_tensor)) {
+            continue;
+        }
+        if (llama_backend_get_hip_device_stream(simple_backend, device, stream) &&
+                simple_tensor->data != nullptr) {
+            device_backend = simple_backend;
+            device_tensor  = simple_tensor;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_context::get_embeddings_nextn_device(llama_device_view & view) const {
+    view = {};
+    if (!device_views_valid || !embd_nextn_device.valid || embd_nextn_device.tensor == nullptr ||
+            embd_nextn_device.backend == nullptr) {
+        return false;
+    }
+    const auto * tensor = embd_nextn_device.tensor;
+    if (tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+    view.data       = tensor->data;
+    view.row_stride = tensor->nb[1];
+    view.n_rows     = embd_nextn_device.n_rows;
+    if (!llama_backend_get_hip_device_stream(
+                embd_nextn_device.backend, view.device, view.stream)) {
+        view = {};
+        return false;
+    }
+    return view.data != nullptr && view.row_stride >= ggml_row_size(tensor->type, tensor->ne[0]) &&
+           view.n_rows > 0;
+}
+
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
+    materialize_device_outputs();
     output_reorder();
 
     try {
@@ -1142,11 +1250,37 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
 }
 
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
+    materialize_device_outputs();
     output_reorder();
 
     GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
 
     return embd_layer_inp[lid].data;
+}
+
+bool llama_context::get_embeddings_layer_inp_device(uint32_t lid, llama_device_view & view) const {
+    view = {};
+    if (!device_views_valid || lid >= embd_layer_inp_device.size()) {
+        return false;
+    }
+    const auto & candidate = embd_layer_inp_device[lid];
+    if (!candidate.valid || candidate.tensor == nullptr || candidate.backend == nullptr) {
+        return false;
+    }
+    const auto * tensor = candidate.tensor;
+    if (tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+    view.data       = tensor->data;
+    view.row_stride = tensor->nb[1];
+    view.n_rows     = candidate.n_rows;
+    if (!llama_backend_get_hip_device_stream(
+                candidate.backend, view.device, view.stream)) {
+        view = {};
+        return false;
+    }
+    return view.data != nullptr && view.row_stride >= ggml_row_size(tensor->type, tensor->ne[0]) &&
+           view.n_rows > 0;
 }
 
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
@@ -1344,6 +1478,10 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn_masked = masked;
 }
 
+void llama_context::set_embeddings_nextn_device_preferred(bool value) {
+    embd_nextn_device_preferred = value;
+}
+
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
@@ -1353,6 +1491,14 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
     sched_need_reserve = true;
+}
+
+void llama_context::set_embeddings_layer_inp_device_preferred(uint32_t lid, bool value) {
+    GGML_ASSERT(lid < embd_layer_inp_device_preferred.size() || lid <= model.hparams.n_layer());
+    if (embd_layer_inp_device_preferred.size() < model.hparams.n_layer() + 1) {
+        embd_layer_inp_device_preferred.resize(model.hparams.n_layer() + 1, false);
+    }
+    embd_layer_inp_device_preferred[lid] = value;
 }
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
@@ -1389,25 +1535,51 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+bool llama_context::resize_recurrent_memory(uint32_t new_n_seq_max, bool expand) {
+    if (!memory) {
+        return false;
+    }
+
+    auto * recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+    if (!recr) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+        if (hybrid) {
+            recr = hybrid->get_mem_recr();
+        } else {
+            auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get());
+            if (hybrid_iswa) {
+                recr = hybrid_iswa->get_mem_recr();
+            }
+        }
+    }
+    if (!recr) {
+        return true; // no recurrent component — nothing to resize
+    }
+
+    const bool resize_needed = expand ? new_n_seq_max > recr->size : new_n_seq_max < recr->size;
+    if (!resize_needed) {
+        return true;
+    }
+
+    synchronize();
+
+    const bool ok = expand ? recr->expand(new_n_seq_max) : recr->shrink(new_n_seq_max);
+    if (ok) {
+        sched_need_reserve = true;
+        for (auto & res : gf_res_prev) {
+            res->reset();
+        }
+    }
+
+    return ok;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
-
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        static bool warned = false;
-        if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-            warned = true;
-        }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
-        }
-        sampling.samplers.erase(seq_id);
-        return false;
-    }
 
     const bool can_offload =
         sampler &&
@@ -1581,6 +1753,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    device_views_valid = false;
+    embd_nextn_device = {};
+    embd_layer_inp_device.assign(cparams.embeddings_layer_inp.size(), {});
+    pending_embd_nextn_copies.clear();
+    pending_embd_layer_inp_copies.assign(cparams.embeddings_layer_inp.size(), {});
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1820,6 +1998,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    device_views_valid = false;
+    embd_nextn_device = {};
+    embd_layer_inp_device.assign(cparams.embeddings_layer_inp.size(), {});
+    pending_embd_nextn_copies.clear();
+    pending_embd_layer_inp_copies.assign(cparams.embeddings_layer_inp.size(), {});
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2042,6 +2226,28 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
 
+        // A direct device view is safe only when the logical decode stayed in
+        // one ubatch. A later ubatch invalidates all borrowed pointers.
+        const bool one_ubatch = n_tokens_prev == 0 && ubatch.n_tokens == n_tokens_all;
+        if (!one_ubatch) {
+            device_views_valid = false;
+            embd_nextn_device = {};
+            for (auto & item : embd_layer_inp_device) item = {};
+        } else {
+            device_views_valid = true;
+        }
+        if (device_views_valid && one_ubatch && t_h_nextn) {
+            ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+            ggml_backend_t device_backend = nullptr;
+            const ggml_tensor * device_tensor = nullptr;
+            int32_t device = -1;
+            void * stream = nullptr;
+            if (llama_backend_get_hip_device_tensor(
+                        backend_h, t_h_nextn, device_backend, device_tensor, device, stream)) {
+                embd_nextn_device = { device_tensor, device_backend, ubatch.n_tokens, true };
+            }
+        }
+
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
         }
@@ -2139,7 +2345,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                // Borrowed device tensors survive only a single-ubatch decode.
+                // A later ubatch reuses the graph storage, so deferring that
+                // copy would retain a stale pointer (and possibly the previous
+                // ubatch's larger byte count). Materialize multi-ubatch rows in
+                // stream order instead.
+                int32_t device = -1;
+                void * stream = nullptr;
+                if (device_views_valid && embd_nextn_device_preferred &&
+                        llama_backend_get_hip_device_stream(backend_h, device, stream)) {
+                    pending_embd_nextn_copies.push_back({
+                        t_h_nextn, backend_h, embd_nextn_out,
+                        (size_t) n_rows * n_embd * sizeof(float) });
+                } else {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out,
+                            0, (size_t) n_rows * n_embd * sizeof(float));
+                }
                 extract_all_idxs = extract_all_idxs || !masked;
             }
         }
@@ -2413,8 +2634,26 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
-        // Tensor-split backends require a zero source offset.
-        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        ggml_backend_t device_backend = nullptr;
+        const ggml_tensor * device_tensor = nullptr;
+        int32_t device = -1;
+        void * stream = nullptr;
+        const bool have_device_tensor = device_views_valid &&
+                llama_backend_get_hip_device_tensor(
+                        backend, t, device_backend, device_tensor, device, stream);
+        if (have_device_tensor && token_offset == 0) {
+            embd_layer_inp_device[il] = {
+                device_tensor, device_backend, (uint32_t) n_tokens, true };
+        } else {
+            embd_layer_inp_device[il] = {};
+        }
+        if (have_device_tensor && il < embd_layer_inp_device_preferred.size() &&
+                embd_layer_inp_device_preferred[il]) {
+            pending_embd_layer_inp_copies[il].push_back({
+                t, backend, embd_layer_inp[il].data + dst_offset, nbytes });
+        } else {
+            ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        }
         extracted = true;
     }
     return extracted;
@@ -2524,6 +2763,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_DEEPSEEK41 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
+        model.arch == LLM_ARCH_DFLASH || // DSpark drafters may reuse the deepseek4-style MLA/MoE/HC graph
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
         model.arch == LLM_ARCH_HY_V4) {
@@ -2540,6 +2780,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        const uint32_t selector_tokens = std::min<uint32_t>(
+                n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
+        res += 32*selector_tokens;
+    }
+
+    uint32_t n_sampling_nodes = 0;
+    uint32_t n_sampling_nodes_max = 0;
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
     }
@@ -2875,6 +3123,96 @@ llm_graph_cb llama_context::graph_get_cb() const {
 //
 // state save/load
 //
+
+static bool llama_safe_state_io_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_HIP_SAFE_STATE_IO");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+// Multi-device ROCm can fault while copying large pageable state buffers even when
+// their lifetime is synchronized (ROCm/rocm-systems#4817). Keep opted-in host state
+// allocations registered for the complete deferred tensor transfer scope.
+class llama_host_buffer_registration {
+public:
+    llama_host_buffer_registration(
+            const std::vector<ggml_backend_ptr> & backends,
+            const void * buffer,
+            size_t size,
+            bool required) : buffer(const_cast<void *>(buffer)), required(required && size > 0) {
+        if (!this->required) {
+            return;
+        }
+
+        std::vector<ggml_backend_reg_t> checked;
+        bool registration_supported = false;
+        for (const auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (reg == nullptr) {
+                continue;
+            }
+
+            bool seen = false;
+            for (ggml_backend_reg_t checked_reg : checked) {
+                if (checked_reg == reg) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) {
+                continue;
+            }
+            checked.push_back(reg);
+
+            auto register_fn = reinterpret_cast<ggml_backend_register_host_buffer_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer"));
+            auto unregister_fn = reinterpret_cast<ggml_backend_unregister_host_buffer_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer"));
+            if (register_fn == nullptr || unregister_fn == nullptr) {
+                continue;
+            }
+            registration_supported = true;
+            if (!register_fn(this->buffer, size)) {
+                continue;
+            }
+
+            this->unregister_fn = unregister_fn;
+            LLAMA_LOG_DEBUG("%s: registered %.2f MiB host state buffer\n", __func__, size/1024.0/1024.0);
+            return;
+        }
+
+        if (!registration_supported) {
+            // The HIP-specific opt-in is harmless in builds without a compatible GPU backend.
+            this->required = false;
+            return;
+        }
+
+        LLAMA_LOG_ERROR(
+            "%s: GGML_HIP_SAFE_STATE_IO=1 could not register the %.2f MiB host state buffer\n",
+            __func__, size/1024.0/1024.0);
+    }
+
+    ~llama_host_buffer_registration() {
+        if (unregister_fn != nullptr) {
+            unregister_fn(buffer);
+        }
+    }
+
+    llama_host_buffer_registration(const llama_host_buffer_registration &) = delete;
+    llama_host_buffer_registration & operator=(const llama_host_buffer_registration &) = delete;
+
+    bool valid() const {
+        return !required || unregister_fn != nullptr;
+    }
+
+private:
+    void * buffer = nullptr;
+    bool required = false;
+    ggml_backend_unregister_host_buffer_t unregister_fn = nullptr;
+};
 
 class llama_io_write_dummy : public llama_io_write_i {
 public:
@@ -3379,6 +3717,11 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+    llama_host_buffer_registration registration(backends, dst, size, llama_safe_state_io_enabled());
+    if (!registration.valid()) {
+        return 0;
+    }
+
     llama_io_write_host io(dst, size);
     try {
         return state_write_data(io);
@@ -3389,6 +3732,11 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+    llama_host_buffer_registration registration(backends, src, size, llama_safe_state_io_enabled());
+    if (!registration.valid()) {
+        return 0;
+    }
+
     llama_io_read_host io(src, size);
     try {
         return state_read_data(io);
@@ -3415,6 +3763,13 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    const bool host_state = !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    llama_host_buffer_registration registration(
+        backends, dst, size, host_state && llama_safe_state_io_enabled());
+    if (!registration.valid()) {
+        return 0;
+    }
+
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -3434,6 +3789,13 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    const bool host_state = !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    llama_host_buffer_registration registration(
+        backends, src, size, host_state && llama_safe_state_io_enabled());
+    if (!registration.valid()) {
+        return 0;
+    }
+
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
@@ -4259,8 +4621,20 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
 
+void llama_set_embeddings_nextn_device_preferred(llama_context * ctx, bool value) {
+    if (ctx != nullptr) {
+        ctx->set_embeddings_nextn_device_preferred(value);
+    }
+}
+
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_set_embeddings_layer_inp_device_preferred(llama_context * ctx, uint32_t lid, bool value) {
+    if (ctx != nullptr) {
+        ctx->set_embeddings_layer_inp_device_preferred(lid, value);
+    }
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
@@ -4281,6 +4655,13 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
     return ctx->get_embeddings_nextn();
 }
 
+bool llama_get_embeddings_nextn_device(llama_context * ctx, llama_device_view * view) {
+    if (ctx == nullptr || view == nullptr) {
+        return false;
+    }
+    return ctx->get_embeddings_nextn_device(*view);
+}
+
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
@@ -4291,6 +4672,13 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
     return ctx->get_embeddings_layer_inp(lid);
+}
+
+bool llama_get_embeddings_layer_inp_device(llama_context * ctx, uint32_t lid, llama_device_view * view) {
+    if (ctx == nullptr || view == nullptr) {
+        return false;
+    }
+    return ctx->get_embeddings_layer_inp_device(lid, *view);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
@@ -4479,6 +4867,42 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+bool llama_memory_recurrent_expand(llama_memory_t mem, uint32_t new_n_seq_max) {
+    if (!mem) return false;
+    auto * recr = dynamic_cast<llama_memory_recurrent *>(mem);
+    if (!recr) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+        if (hybrid) recr = hybrid->get_mem_recr();
+        else {
+            auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem);
+            if (hybrid_iswa) recr = hybrid_iswa->get_mem_recr();
+        }
+    }
+    return recr ? recr->expand(new_n_seq_max) : true;
+}
+
+bool llama_memory_recurrent_shrink(llama_memory_t mem, uint32_t new_n_seq_max) {
+    if (!mem) return false;
+    auto * recr = dynamic_cast<llama_memory_recurrent *>(mem);
+    if (!recr) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+        if (hybrid) recr = hybrid->get_mem_recr();
+        else {
+            auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem);
+            if (hybrid_iswa) recr = hybrid_iswa->get_mem_recr();
+        }
+    }
+    return recr ? recr->shrink(new_n_seq_max) : true;
+}
+
+bool llama_context_recurrent_expand(llama_context * ctx, uint32_t new_n_seq_max) {
+    return ctx ? ctx->resize_recurrent_memory(new_n_seq_max, true) : false;
+}
+
+bool llama_context_recurrent_shrink(llama_context * ctx, uint32_t new_n_seq_max) {
+    return ctx ? ctx->resize_recurrent_memory(new_n_seq_max, false) : false;
 }
 
 // llama state API

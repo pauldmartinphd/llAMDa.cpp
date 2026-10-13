@@ -6,6 +6,7 @@
 
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
 
@@ -14,6 +15,8 @@
 #include <cassert>
 #include <cmath>
 #include <iterator>
+#include <limits>
+#include <set>
 #include <stdexcept>
 
 //
@@ -49,9 +52,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
+    hparams(model.hparams),
+    n_seq_max(n_seq_max),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
-        // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         // a k-pool indexer caches its per-token rows and the pooled key side by side
         // (glm5-next: key | gate | pooled, qwen4exp: key | pooled)
@@ -70,62 +74,50 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+            nullptr, filter_idx, nullptr, nullptr, "cache_idx");
+    }()),
+    mem_ple(model.hparams.ple_n_heads == 0 ? nullptr : new llama_memory_recurrent(
+            model, GGML_TYPE_F32, GGML_TYPE_F32, offload, rs_size, n_seq_max, n_rs_seq,
+            [&model](uint32_t il) { return model.hparams.is_ple(il); },
+            model.hparams.ple_conv_state(), 1, "cache_ple")) {}
 
-llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
-    // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
+llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(
+        llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    // Repeated from llama_memory_hybrid::init_batch because the indexer must
+    // receive the attention cache's exact slot infos.
     do {
         balloc.split_reset();
 
-        // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
-
         while (true) {
             llama_ubatch ubatch;
-
             if (embd_all) {
-                // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
-                // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
-                const bool unified = (get_mem_attn()->get_n_stream() == 1);
-
-                // [TAG_RECURRENT_ROLLBACK_SPLITS]
-                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
-                //   so that the rollback snapshots remain valid
+                const bool unified = get_mem_attn()->get_n_stream() == 1;
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
-
                 ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
-
             if (ubatch.n_tokens == 0) {
                 break;
             }
-
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }
 
         if (balloc.get_n_used() < balloc.get_n_tokens()) {
-            // failed to find a suitable split
             break;
         }
-
-        // prepare the recurrent batches first
-        if (!get_mem_recr()->prepare(ubatches)) {
-            // TODO: will the recurrent cache be in an undefined context at this point?
+        if (!get_mem_recr()->prepare(ubatches) || (mem_ple && !mem_ple->prepare(ubatches))) {
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        // prepare the attention cache
         auto heads_attn = get_mem_attn()->prepare(ubatches);
         if (heads_attn.empty()) {
             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        // the indexer uses the attention cache's slot layout; a separate one can drift from it
         llama_kv_cache::slot_info_vec_t heads_idx;
         if (mem_idx) {
             heads_idx = heads_attn;
@@ -133,7 +125,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
 
         return std::make_unique<llama_memory_hybrid_idx_context>(
                 this, std::move(heads_attn), std::move(heads_idx), std::move(ubatches));
-    } while(false);
+    } while (false);
 
     return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
@@ -146,13 +138,22 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
 
+bool llama_memory_hybrid_idx::get_can_shift() const {
+    return llama_memory_hybrid::get_can_shift() &&
+           (!mem_idx || (mem_idx->get_can_shift() && mem_idx->get_size() == get_mem_attn()->get_size())) &&
+           (!mem_ple || mem_ple->get_can_shift());
+}
+
 void llama_memory_hybrid_idx::clear(bool data) {
     llama_memory_hybrid::clear(data);
-
     if (mem_idx) {
         mem_idx->clear(data);
         mem_idx_stale_set(-1, 0);
     }
+    if (mem_ple) {
+        mem_ple->clear(data);
+    }
+    ple_history.clear();
 }
 
 // A pooled key is only valid while the grouping that produced it holds. Grouping is sequence relative,
@@ -183,18 +184,24 @@ llama_pos llama_memory_hybrid_idx::mem_idx_stale_pos(llama_seq_id seq_id, llama_
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
+    // Recurrent removal is the participant that may refuse. Do it first so a
+    // failed partial rollback leaves attention, indexer, and PLE state intact.
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
     }
-
+    if (mem_ple && !mem_ple->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+    if (!get_mem_attn()->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
     if (mem_idx) {
         const llama_pos stale = mem_idx_stale_pos(seq_id, p0);
         mem_idx->seq_rm(seq_id, p0, p1);
         mem_idx_stale_set(seq_id, stale);
     }
-
-    return get_mem_attn()->seq_rm(seq_id, p0, p1);
+    ple_seq_rm(seq_id, p0, p1);
+    return true;
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -202,59 +209,82 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
     GGML_ASSERT(p0 <= 0 && p1 < 0 && "partial seq_cp is not supported");
 
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
-
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
         // a whole sequence copy gives the destination the source's pools, rep rows included: the source keeps its
         // pooled keys, the destination rebuilds its layout and re-pools into the same rows
         mem_idx_stale_set(seq_id_dst, 0);
     }
+    if (mem_ple) {
+        mem_ple->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
+    ple_seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     llama_memory_hybrid::seq_keep(seq_id);
-
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
         // every other sequence loses its cells, so their layouts must rebuild
         mem_idx_stale_set(-1, 0);
     }
+    if (mem_ple) {
+        mem_ple->seq_keep(seq_id);
+    }
+    ple_seq_keep(seq_id);
 }
 
-void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+void llama_memory_hybrid_idx::seq_add(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
-
     if (mem_idx) {
         // a negative shift moves the cells below p0, so they regroup as well
         const llama_pos stale = mem_idx_stale_pos(seq_id, shift < 0 ? p0 + shift : p0);
         mem_idx->seq_add(seq_id, p0, p1, shift);
         mem_idx_stale_set(seq_id, stale);
     }
+    if (mem_ple) {
+        mem_ple->seq_add(seq_id, p0, p1, shift);
+    }
+    ple_seq_add(seq_id, p0, p1, shift);
 }
 
-void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+void llama_memory_hybrid_idx::seq_div(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
-
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
         mem_idx_stale_set(seq_id, 0);
     }
+    if (mem_ple) {
+        mem_ple->seq_div(seq_id, p0, p1, d);
+    }
+    ple_seq_div(seq_id, p0, p1, d);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
-    std::map<ggml_backend_buffer_type_t, size_t> mb = llama_memory_hybrid::memory_breakdown();
-
+    auto mb = llama_memory_hybrid::memory_breakdown();
     if (mem_idx) {
         for (const auto & buft_size : mem_idx->memory_breakdown()) {
             mb[buft_size.first] += buft_size.second;
         }
     }
-
+    if (mem_ple) {
+        for (const auto & buft_size : mem_ple->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
+    }
     return mb;
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     llama_memory_hybrid::state_write(io, seq_id, flags);
+    if (mem_ple) {
+        mem_ple->state_write(io, seq_id, flags);
+    }
+    if (hparams.ple_n_heads > 0) {
+        ple_state_write(io, seq_id);
+    }
 
     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
     if (mem_idx) {
@@ -276,6 +306,12 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
 
         get_mem_recr()->state_read(io, seq_id, flags);
+        if (mem_ple) {
+            mem_ple->state_read(io, seq_id, flags);
+        }
+        if (hparams.ple_n_heads > 0) {
+            ple_state_read(io, seq_id);
+        }
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if (mem_idx) {
@@ -305,6 +341,10 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
 
     get_mem_attn()->state_clear(seq_id);
     get_mem_recr()->seq_rm(seq_id, -1, -1);
+    if (mem_ple) {
+        mem_ple->seq_rm(seq_id, -1, -1);
+    }
+    ple_seq_rm(seq_id, -1, -1);
 
     if (mem_idx) {
         mem_idx->state_clear(seq_id);
@@ -316,20 +356,317 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
 
+llama_memory_recurrent * llama_memory_hybrid_idx::get_mem_ple() const {
+    return mem_ple.get();
+}
+
+void llama_memory_hybrid_idx::ple_append(
+        llama_seq_id seq_id, llama_pos pos, llama_token token) {
+    if (hparams.ple_n_heads == 0 || seq_id < 0 || pos < 0 || token < 0) {
+        return;
+    }
+
+    auto & history = ple_history[seq_id];
+    history.push_back({pos, token});
+
+    const uint64_t max_entries_u64 =
+            (uint64_t) get_mem_attn()->get_size() + hparams.ple_ngram_size + 1;
+    const size_t max_entries = (size_t) std::min<uint64_t>(
+            max_entries_u64, std::numeric_limits<size_t>::max());
+    if (history.size() > max_entries) {
+        history.erase(history.begin(), history.begin() + (history.size() - max_entries));
+    }
+}
+
+void llama_memory_hybrid_idx::ple_apply_ubatch(
+        const llama_ubatch & ubatch, ple_prefix_map & prefix) {
+    prefix.clear();
+    if (hparams.ple_n_heads == 0) {
+        return;
+    }
+
+    const size_t lookback = hparams.ple_ngram_size > 0 ? hparams.ple_ngram_size - 1 : 0;
+    for (int64_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][s];
+            if (seq_id < 0 || prefix.count(seq_id) != 0) {
+                continue;
+            }
+
+            auto & tail = prefix[seq_id];
+            const auto found = ple_history.find(seq_id);
+            if (found == ple_history.end()) {
+                continue;
+            }
+            const auto & history = found->second;
+            const size_t first = history.size() > lookback ? history.size() - lookback : 0;
+            tail.reserve(history.size() - first);
+            for (size_t j = first; j < history.size(); ++j) {
+                tail.push_back(history[j].token);
+            }
+        }
+    }
+
+    const llama_token embd_token = (llama_token) hparams.ple_image_token_id;
+    for (int64_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_token token = ubatch.token ? ubatch.token[i] : embd_token;
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][s];
+            bool duplicate = false;
+            for (int32_t prev = 0; prev < s; ++prev) {
+                duplicate |= ubatch.seq_id[i][prev] == seq_id;
+            }
+            if (!duplicate) {
+                ple_append(seq_id, ubatch.pos[i], token);
+            }
+        }
+    }
+}
+
+void llama_memory_hybrid_idx::ple_seq_rm(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (hparams.ple_n_heads == 0) {
+        return;
+    }
+    p0 = std::max<llama_pos>(p0, 0);
+    p1 = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+
+    auto erase_range = [p0, p1](ple_seq_history & history) {
+        history.erase(std::remove_if(history.begin(), history.end(), [p0, p1](const ple_history_entry & entry) {
+            return p0 <= entry.pos && entry.pos < p1;
+        }), history.end());
+    };
+
+    if (seq_id >= 0) {
+        auto it = ple_history.find(seq_id);
+        if (it != ple_history.end()) {
+            erase_range(it->second);
+            if (it->second.empty()) {
+                ple_history.erase(it);
+            }
+        }
+    } else {
+        for (auto it = ple_history.begin(); it != ple_history.end();) {
+            erase_range(it->second);
+            it = it->second.empty() ? ple_history.erase(it) : std::next(it);
+        }
+    }
+}
+
+void llama_memory_hybrid_idx::ple_seq_cp(
+        llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (hparams.ple_n_heads == 0 || seq_id_src == seq_id_dst) {
+        return;
+    }
+    const auto src = ple_history.find(seq_id_src);
+    if (src == ple_history.end()) {
+        return;
+    }
+    p0 = std::max<llama_pos>(p0, 0);
+    p1 = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+
+    ple_seq_history copied;
+    for (const auto & entry : src->second) {
+        if (p0 <= entry.pos && entry.pos < p1) {
+            copied.push_back(entry);
+        }
+    }
+    if (copied.empty()) {
+        return;
+    }
+
+    auto & dst = ple_history[seq_id_dst];
+    auto first = std::find_if(dst.begin(), dst.end(), [p0](const ple_history_entry & entry) {
+        return entry.pos >= p0;
+    });
+    const size_t insert_at = first - dst.begin();
+    dst.erase(std::remove_if(dst.begin(), dst.end(), [p0, p1](const ple_history_entry & entry) {
+        return p0 <= entry.pos && entry.pos < p1;
+    }), dst.end());
+    dst.insert(dst.begin() + std::min(insert_at, dst.size()), copied.begin(), copied.end());
+
+    const uint64_t max_entries_u64 =
+            (uint64_t) get_mem_attn()->get_size() + hparams.ple_ngram_size + 1;
+    const size_t max_entries = (size_t) std::min<uint64_t>(
+            max_entries_u64, std::numeric_limits<size_t>::max());
+    if (dst.size() > max_entries) {
+        dst.erase(dst.begin(), dst.begin() + (dst.size() - max_entries));
+    }
+}
+
+void llama_memory_hybrid_idx::ple_seq_keep(llama_seq_id seq_id) {
+    if (hparams.ple_n_heads == 0) {
+        return;
+    }
+    for (auto it = ple_history.begin(); it != ple_history.end();) {
+        it = it->first == seq_id ? std::next(it) : ple_history.erase(it);
+    }
+}
+
+void llama_memory_hybrid_idx::ple_seq_add(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (hparams.ple_n_heads == 0 || shift == 0) {
+        return;
+    }
+    const auto found = ple_history.find(seq_id);
+    if (found == ple_history.end()) {
+        return;
+    }
+    p0 = std::max<llama_pos>(p0, 0);
+    p1 = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+
+    ple_seq_history shifted;
+    shifted.reserve(found->second.size());
+    for (auto entry : found->second) {
+        if (p0 <= entry.pos && entry.pos < p1) {
+            entry.pos += shift;
+        }
+        if (entry.pos >= 0) {
+            shifted.push_back(entry);
+        }
+    }
+    found->second = std::move(shifted);
+}
+
+void llama_memory_hybrid_idx::ple_seq_div(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (hparams.ple_n_heads == 0 || d == 1) {
+        return;
+    }
+    GGML_ASSERT(d > 0);
+    const auto found = ple_history.find(seq_id);
+    if (found == ple_history.end()) {
+        return;
+    }
+    p0 = std::max<llama_pos>(p0, 0);
+    p1 = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+
+    for (auto & entry : found->second) {
+        if (p0 <= entry.pos && entry.pos < p1) {
+            entry.pos /= d;
+        }
+    }
+}
+
+void llama_memory_hybrid_idx::ple_state_write(
+        llama_io_write_i & io, llama_seq_id seq_id) const {
+    constexpr uint32_t version = 2;
+    io.write(&version, sizeof(version));
+
+    auto write_history = [&io](const ple_seq_history & history) {
+        if (history.size() > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("Qwen4Exp PLE history is too large to serialize");
+        }
+        const uint32_t count = static_cast<uint32_t>(history.size());
+        io.write(&count, sizeof(count));
+        for (const auto & entry : history) {
+            io.write(&entry.pos,   sizeof(entry.pos));
+            io.write(&entry.token, sizeof(entry.token));
+        }
+    };
+
+    if (seq_id >= 0) {
+        const auto found = ple_history.find(seq_id);
+        const ple_seq_history empty;
+        write_history(found == ple_history.end() ? empty : found->second);
+        return;
+    }
+
+    uint32_t n_seq = 0;
+    for (const auto & entry : ple_history) {
+        n_seq += !entry.second.empty();
+    }
+    io.write(&n_seq, sizeof(n_seq));
+    for (const auto & entry : ple_history) {
+        if (entry.second.empty()) {
+            continue;
+        }
+        io.write(&entry.first, sizeof(entry.first));
+        write_history(entry.second);
+    }
+}
+
+void llama_memory_hybrid_idx::ple_state_read(
+        llama_io_read_i & io, llama_seq_id seq_id) {
+    const uint64_t max_entries_u64 =
+            (uint64_t) get_mem_attn()->get_size() + hparams.ple_ngram_size + 1;
+    const uint32_t max_entries = (uint32_t) std::min<uint64_t>(
+            max_entries_u64, std::numeric_limits<uint32_t>::max());
+    const uint32_t max_sequences = std::max<uint32_t>(n_seq_max, 1);
+
+    uint32_t version = 0;
+    io.read(&version, sizeof(version));
+    if (version != 1 && version != 2) {
+        throw std::runtime_error("unsupported Qwen4Exp PLE history state version");
+    }
+
+    auto read_history = [&io, max_entries](ple_seq_history & history) {
+        uint32_t count = 0;
+        io.read(&count, sizeof(count));
+        if (count > max_entries) {
+            throw std::runtime_error("invalid Qwen4Exp PLE history size");
+        }
+        history.clear();
+        history.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            llama_pos pos;
+            llama_token token;
+            io.read(&pos,   sizeof(pos));
+            io.read(&token, sizeof(token));
+            if (pos < 0 || token < 0) {
+                throw std::runtime_error("invalid Qwen4Exp PLE history entry");
+            }
+            history.push_back({pos, token});
+        }
+    };
+
+    if (seq_id >= 0) {
+        auto & history = ple_history[seq_id];
+        read_history(history);
+        if (history.empty()) {
+            ple_history.erase(seq_id);
+        }
+        return;
+    }
+
+    uint32_t n_seq = 0;
+    io.read(&n_seq, sizeof(n_seq));
+    if (n_seq > max_sequences) {
+        throw std::runtime_error("invalid Qwen4Exp PLE sequence count");
+    }
+    ple_history.clear();
+    std::set<llama_seq_id> seen_sequences;
+    for (uint32_t i = 0; i < n_seq; ++i) {
+        llama_seq_id stored_seq;
+        io.read(&stored_seq, sizeof(stored_seq));
+        if (stored_seq < 0 || (uint32_t) stored_seq >= n_seq_max ||
+                !seen_sequences.insert(stored_seq).second) {
+            throw std::runtime_error("invalid or duplicate Qwen4Exp PLE sequence id");
+        }
+        auto & history = ple_history[stored_seq];
+        read_history(history);
+        if (history.empty()) {
+            ple_history.erase(stored_seq);
+        }
+    }
+}
+
 //
 // llama_memory_hybrid_idx_context
 //
 
-// streams in each ubatch's slot info, matching get_k/get_v's `ns`
-static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::slot_info_vec_t & sinfos) {
-    std::vector<uint32_t> res;
-    res.reserve(sinfos.size());
-
+static std::vector<std::vector<llama_seq_id>> llama_memory_hybrid_idx_stream_ids(
+        const llama_kv_cache::slot_info_vec_t & sinfos, size_t n_ubatches) {
+    GGML_ASSERT(sinfos.empty() || sinfos.size() == n_ubatches);
+    std::vector<std::vector<llama_seq_id>> result;
+    result.reserve(std::max(sinfos.size(), n_ubatches));
     for (const auto & sinfo : sinfos) {
-        res.push_back(sinfo.s1 - sinfo.s0 + 1);
+        result.push_back(sinfo.strm);
     }
-
-    return res;
+    // PLE also uses this vector as the marker for actual batch contexts. Keep
+    // one entry per ubatch even if an older/dense-only model has no index cache.
+    result.resize(n_ubatches);
+    return result;
 }
 
 // Which cells of a sequence make up which pool, for the whole cache.
@@ -468,6 +805,18 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
     return lay;
 }
 
+static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::slot_info_vec_t & sinfos) {
+    std::vector<uint32_t> res;
+    res.reserve(sinfos.size());
+
+    for (const auto & sinfo : sinfos) {
+        res.push_back(sinfo.s1 - sinfo.s0 + 1);
+    }
+
+    return res;
+}
+
+
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
     llama_memory_hybrid_context(status) {}
 
@@ -479,7 +828,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     ns_ubatch(mem->get_mem_idx() == nullptr ?
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx())) {
+        new llama_kv_cache_context(mem->get_mem_idx())),
+    ctx_ple(mem->get_mem_ple() ? mem->get_mem_ple()->init_full() : nullptr) {
     if (kpool_track()) {
         mem->kpool_layout_update();
         auto st = kpool_build_sizes();
@@ -500,22 +850,22 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
                            bool   optimize) :
     llama_memory_hybrid_context(mem, lctx, optimize),
     mem(mem),
-    // update() applies a pending cross-stream seq_cp, else the copy keeps stale indexer keys
-    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        mem->get_mem_idx()->init_update(lctx, optimize)) {}
+    ctx_idx(mem->get_mem_idx() ? mem->get_mem_idx()->init_update(lctx, optimize) : nullptr),
+    ctx_ple(mem->get_mem_ple() ? mem->get_mem_ple()->init_update(lctx, optimize) : nullptr) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
                 slot_info_vec_t   sinfos_attn,
                 slot_info_vec_t   sinfos_idx,
       std::vector<llama_ubatch>   ubatches) :
-    // note: the base copies the ubatches; ctx_idx gets a copy of its own
     llama_memory_hybrid_context(mem, std::move(sinfos_attn), ubatches),
     mem(mem),
+    stream_ids_ubatch(llama_memory_hybrid_idx_stream_ids(sinfos_idx, ubatches.size())),
     ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
     sinfos_kpool(mem->get_mem_idx() != nullptr && mem->get_kpool() > 0 && mem->get_kpool_by_order() ? sinfos_idx : slot_info_vec_t()),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {
+        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)),
+    ctx_ple(mem->get_mem_ple() ? new llama_memory_recurrent_context(mem->get_mem_ple(), ubatches) : nullptr) {
     // Sequence edits force the touched positions to re-pool.
     mem_idx_stale_batch = mem->mem_idx_stale_get();
 }
@@ -528,33 +878,48 @@ bool llama_memory_hybrid_idx_context::next() {
         mem->mem_idx_stale_clear();
     }
 
+    const bool idx_more = ctx_idx ? ctx_idx->next() : false;
+    const bool ple_more = ctx_ple ? ctx_ple->next() : false;
+    const bool base_more = llama_memory_hybrid_context::next();
     if (ctx_idx) {
-        ctx_idx->next();
+        GGML_ASSERT(idx_more == base_more);
     }
-
+    if (ctx_ple) {
+        GGML_ASSERT(ple_more == base_more);
+    }
     ++i_cur;
-
-    return llama_memory_hybrid_context::next();
+    return base_more;
 }
 
 bool llama_memory_hybrid_idx_context::apply() {
-    bool res = llama_memory_hybrid_context::apply();
-
+    bool result = llama_memory_hybrid_context::apply();
     if (ctx_idx) {
-        res = res & ctx_idx->apply();
+        result = result & ctx_idx->apply();
     }
-
-    // Extend the pool layout with this ubatch's cells, then pick what it must re-pool.
-    if (res && kpool_track()) {
+    if (ctx_ple) {
+        result = result & ctx_ple->apply();
+    }
+    if (result && !stream_ids_ubatch.empty()) {
+        GGML_ASSERT(mem != nullptr);
+        mem->ple_apply_ubatch(get_ubatch(), ple_prefix);
+    }
+    if (result && kpool_track()) {
         mem->kpool_layout_update();
         if (!kpool_st) {
             kpool_st = std::make_unique<kpool_state>();
         }
         kpool_build_state(get_ubatch());
-        i_kpool  = i_cur;
+        i_kpool = i_cur;
     }
+    return result;
+}
 
-    return res;
+llama_memory_status llama_memory_hybrid_idx_context::get_status() const {
+    const auto base_idx = llama_memory_status_combine(
+            llama_memory_hybrid_context::get_status(),
+            ctx_idx ? ctx_idx->get_status() : LLAMA_MEMORY_STATUS_NO_UPDATE);
+    return llama_memory_status_combine(
+            base_idx, ctx_ple ? ctx_ple->get_status() : LLAMA_MEMORY_STATUS_NO_UPDATE);
 }
 
 bool llama_memory_hybrid_idx_context::kpool_track() const {
@@ -566,10 +931,16 @@ const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const 
     return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
 }
 
-uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
-    GGML_ASSERT(i_cur < ns_ubatch.size());
+const llama_memory_recurrent_context * llama_memory_hybrid_idx_context::get_ple() const {
+    return static_cast<const llama_memory_recurrent_context *>(ctx_ple.get());
+}
 
-    return ns_ubatch[i_cur];
+uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
+    if (!stream_ids_ubatch.empty()) {
+        GGML_ASSERT(i_cur < stream_ids_ubatch.size());
+        return stream_ids_ubatch[i_cur].size();
+    }
+    return mem && mem->get_mem_idx() ? mem->get_mem_idx()->get_n_stream() : 0;
 }
 
 llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd) : ctx(ctx) {
@@ -973,4 +1344,16 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     }
+}
+
+llama_token llama_memory_hybrid_idx_context::ple_prefix_token(
+        llama_seq_id seq_id, size_t lookback, llama_token fallback) const {
+    if (lookback == 0) {
+        return fallback;
+    }
+    const auto found = ple_prefix.find(seq_id);
+    if (found == ple_prefix.end() || lookback > found->second.size()) {
+        return fallback;
+    }
+    return found->second[found->second.size() - lookback];
 }

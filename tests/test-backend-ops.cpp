@@ -45,6 +45,7 @@
 #include <vector>
 #include <unordered_map>
 
+
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
 #else
@@ -11251,6 +11252,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 #endif
 
+    // Laguna S.2 uses 256 experts and routes each token to 10 experts. Cover
+    // wave32 padded-16 routing, odd token counts, MMQ J tails, and both the
+    // broadcast gate/up and expert-specific down-projection activation layouts.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (bool b : {false, true}) {
+            for (int n : {1, 9, 63, 64, 65, 255, 256}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 10, b, 128, n, 256));
+            }
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
@@ -11670,6 +11682,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
+    // Qwen large-vocabulary sampling and rocPRIM partial-selection boundaries.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 20));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 256));
+    // Qwen4Exp QSA: n_kv crosses the gfx1030 HIP CUB failure boundary while
+    // retaining a 2048-token budget plus the incomplete four-token tail.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4608, 512, 1, 1}, 2051));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
@@ -12228,6 +12246,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_falcon(2));
 #endif
 
+    // DSV4 production physical-batch shape; keep one focused correctness case.
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 256, 256, 1, 1, GGML_TYPE_F16));
+
     // lightning_indexer
     for (int kv : { 256 }) {
         for (int bs : { 1, 512 }) {
@@ -12472,6 +12493,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
         }
+    }
+    // Laguna S.2 four-way tensor-split expert shapes.
+    for (int bs : {1, 8, 64, 256}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 10, true,  256, bs, 3072));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 10, false, 768, bs, 1024));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 10, false, 768, bs, 1024));
     }
 
     // qwen3-30b-a3b
@@ -12746,7 +12773,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
-        for (int bs : { 1, 512, 2048 }) {
+        for (int bs : { 1, 256, 512, 2048 }) {
             for (int nh : { 4, 32, 64 }) {
                 for (int ns : { 1, 4 }) {
                     for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {

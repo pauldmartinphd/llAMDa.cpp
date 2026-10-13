@@ -1,6 +1,7 @@
 #include "llama-hparams.h"
 #include "models.h"
 
+#include "deepseek4-mmq-config.h"
 #include "llama-kv-cache-dsv4.h"
 
 #include <algorithm>
@@ -89,6 +90,18 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
+    const deepseek4_mmq_model_config mmq_config = {
+        /*.n_layer         =*/ hparams.n_layer(),
+        /*.n_embd          =*/ n_embd,
+        /*.n_ff_exp        =*/ n_ff_exp,
+        /*.n_expert        =*/ n_expert,
+        /*.n_expert_used   =*/ n_expert_used,
+        /*.tensor_parallel =*/ split_mode() == LLAMA_SPLIT_MODE_TENSOR && devices.size() == 1 && devices[0].is_meta,
+        /*.n_devices       =*/ get_split_state_ud.n_devices,
+        /*.tensor_split    =*/ tensor_split(),
+    };
+    const bool auto_rdna2_mmq_j16 = deepseek4_use_auto_rdna2_mmq_j16(mmq_config);
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -158,6 +171,12 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
+
+        if (auto_rdna2_mmq_j16 && i < n_layer) {
+            for (ggml_tensor * tensor : { layer.ffn_gate_exps, layer.ffn_down_exps, layer.ffn_up_exps }) {
+                tensor->flags |= GGML_TENSOR_FLAG_MUL_MAT_ID_MMQ_J16;
+            }
+        }
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, flags);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, flags);
@@ -1358,6 +1377,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     res->t_embd = cur;
 
     cur = ggml_mul_mat(ctx0, model.output, cur);
+    if (model.is_tensor_parallel_output_head(model.output)) {
+        cur->flags |= GGML_TENSOR_FLAG_FORCE_FP32_ALLREDUCE;
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
@@ -1504,6 +1526,9 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     GGML_ASSERT(head_w && "DEEPSEEK4 MTP missing LM head");
     cur = ggml_mul_mat(ctx0, head_w, cur);
+    if (model.is_tensor_parallel_output_head(head_w)) {
+        cur->flags |= GGML_TENSOR_FLAG_FORCE_FP32_ALLREDUCE;
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

@@ -321,4 +321,3 @@
 {%- if image_prompts is defined and image_prompts is not none and state.image_index != image_prompts|length -%}
     {{- raise_exception('image prompt count ' + image_prompts|length|string + ' != consumed placeholder count ' + state.image_index|string) -}}
 {%- endif -%}
-

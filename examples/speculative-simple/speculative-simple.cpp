@@ -61,13 +61,18 @@ int main(int argc, char ** argv) {
 
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = spec_init->context();
+        params.speculative.draft.sidecar_only = spec_init->sidecar_only();
+        params.speculative.draft.sidecar_type = spec_init->sidecar_only()
+                ? spec_init->sidecar_type() : COMMON_SPECULATIVE_TYPE_NONE;
     }
 
     llama_context * ctx_dft = params.speculative.draft.ctx_dft;
 
     // check if the context supports partial sequence removal
-    const bool use_ckpt_tgt = common_context_can_seq_rm(ctx_tgt) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-    const bool use_ckpt_dft = common_context_can_seq_rm(ctx_dft) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    const auto ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+    const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    const bool use_ckpt_dft = ctx_dft != nullptr &&
+            common_context_can_seq_rm(ctx_dft) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
     if (use_ckpt_tgt) {
         LOG_INF("speculative decoding will use checkpoints (context does not support partial sequence removal)\n");
@@ -136,6 +141,12 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s", "failed to process speculative prompt\n");
             return 1;
         }
+        // Prompt rows are unconditionally accepted. Sidecars stage target KV
+        // until this explicit commit so their first draft starts at n_past.
+        if (!common_speculative_commit_state(spec, seq_id, (llama_pos) batch_prompt.n_tokens)) {
+            LOG_ERR("%s", "failed to commit speculative prompt state\n");
+            return 1;
+        }
     }
 
     // note: keep the last token separate!
@@ -152,6 +163,7 @@ int main(int argc, char ** argv) {
     common_batch batch_tgt(ctx_tgt);
 
     llama_tokens draft;
+    std::vector<common_speculative_token_dist> dists;
 
     common_prompt_checkpoint ckpt;
 
@@ -188,10 +200,14 @@ int main(int argc, char ** argv) {
             common_speculative_get_draft_params(spec, seq_id) = {
                 /* .drafting   = */ true,
                 /* .n_max      = */ n_draft_max,
-                /* .pos0       = */ n_past,
+                /* .n_max_user_override = */ false,
+                /* .pos0     = */ n_past,
                 /* .id_last    = */ id_last,
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft, // output
+                /* .dists      = */ &dists,
+                /* .temperature = */ params.sampling.temp,
+                /* .seed       = */ common_sampler_get_seed(smpl.get()),
             };
             common_speculative_draft(spec);
 
@@ -201,6 +217,7 @@ int main(int argc, char ** argv) {
                 if (use_ckpt_tgt) {
                     ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
+                common_speculative_get_state(spec, seq_id, ckpt.data_spec);
             }
 
             // reset the draft context to the checkpoint before verification
@@ -237,6 +254,11 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s", "failed to process speculative batch\n");
             break;
         }
+        if (draft.empty() && !common_speculative_commit_state(
+                    spec, seq_id, batch_tgt.pos[batch_tgt.n_tokens - 1] + 1)) {
+            LOG_ERR("%s", "failed to commit non-speculative target state\n");
+            break;
+        }
 
         // only save the sampler sampler state if we use checkpoints
         common_sampler_ptr smpl_save;
@@ -254,7 +276,12 @@ int main(int argc, char ** argv) {
         // available logits from the batch and sample the next token until we run out of logits or the sampler
         // disagrees with the draft
         //
-        auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+        const bool can_rollback =
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+            (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() <= llama_n_rs_seq(ctx_tgt));
+        auto ids = can_rollback && params.sampling.temp > 0.0f && dists.size() == draft.size()
+            ? common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft, dists)
+            : common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
 
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 
@@ -267,9 +294,13 @@ int main(int argc, char ** argv) {
             LOG_DBG("partial acceptance: %zu < %zu, restoring checkpoint\n", ids.size() - 1, n_draft);
 
             draft = std::move(ids);
+            dists.clear();
 
             {
                 GGML_ASSERT(ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                if (!common_speculative_set_state(spec, seq_id, ckpt.data_spec)) {
+                    LOG_WRN("%s", "failed to restore speculative sidecar state; continuing target-only\n");
+                }
 
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
             }
@@ -324,6 +355,7 @@ int main(int argc, char ** argv) {
 
         // clear the draft since it has been consumed
         draft.clear();
+        dists.clear();
 
         {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);

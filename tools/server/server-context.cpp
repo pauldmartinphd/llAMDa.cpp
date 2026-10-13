@@ -18,6 +18,8 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "speculative-content.h"
+#include "server-speculative-sampling.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "base64.hpp"
@@ -25,6 +27,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -42,6 +46,220 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static bool server_env_disabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr &&
+        (std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0 || std::strcmp(value, "false") == 0);
+}
+
+static bool server_gfx1030_native_auto_enabled() {
+    if (server_env_disabled("GGML_HIP_RDNA2_AUTO")) {
+        return false;
+    }
+    if (const char * native = std::getenv("GGML_HIP_GFX1030_NATIVE")) {
+        return std::atoi(native) != 0;
+    }
+    const char * override_gfx = std::getenv("HSA_OVERRIDE_GFX_VERSION");
+    return override_gfx != nullptr && std::strcmp(override_gfx, "10.3.0") == 0;
+}
+
+static bool server_env_enabled(const char * name) {
+    return std::getenv(name) != nullptr && !server_env_disabled(name);
+}
+
+// The gfx1030 stacked K4V cap is a server-level safety envelope. The
+// sidecar-only content POC may widen K4V within a reserved base+boost envelope,
+// while neural generation, native paths, and explicit overrides stay fixed.
+static bool server_sidecar_content_boost_enabled(const common_params & params) {
+    return common_speculative_content_runtime_eligible(params.speculative) &&
+            common_speculative_content_env_enabled();
+}
+
+static bool server_vocab_sharded_output_enabled() {
+    const char * value = std::getenv("GGML_TP_SHARDED_OUTPUT");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static bool server_gfx1030_spec_target_backend_sampling_profile(const common_params & params) {
+    if (!server_gfx1030_native_auto_enabled() ||
+            server_env_disabled("GGML_HIP_GFX1030_TARGET_BACKEND_SAMPLING") ||
+            server_vocab_sharded_output_enabled()) {
+        return false;
+    }
+
+    const auto profile = server_spec_target_backend_profile_select(params.speculative);
+    if (!profile ||
+            (profile.has_ngram_mod &&
+             !server_env_enabled("GGML_HIP_GFX1030_STACKED_TARGET_BACKEND_SAMPLING"))) {
+        return false;
+    }
+
+    if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        return false;
+    }
+
+    size_t n_rocm_devices = 0;
+    for (ggml_backend_dev_t device : params.devices) {
+        if (device == nullptr) {
+            continue;
+        }
+        const char * name = ggml_backend_dev_name(device);
+        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                name == nullptr || std::strncmp(name, "ROCm", 4) != 0) {
+            return false;
+        }
+        ++n_rocm_devices;
+    }
+    return n_rocm_devices == 4;
+}
+
+static int32_t server_gfx1030_neural_k4v_cycle_cap(const common_params & params) {
+    if (!server_gfx1030_native_auto_enabled() || params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        return -1;
+    }
+
+    size_t n_rocm_devices = 0;
+    for (ggml_backend_dev_t device : params.devices) {
+        if (device == nullptr) {
+            continue;
+        }
+        const char * name = ggml_backend_dev_name(device);
+        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                name == nullptr || std::strncmp(name, "ROCm", 4) != 0) {
+            return -1;
+        }
+        ++n_rocm_devices;
+    }
+    if (n_rocm_devices != 4) {
+        return -1;
+    }
+
+    return server_spec_gfx1030_neural_k4v_cycle_cap(params.speculative);
+}
+
+static bool server_gfx1030_sidecar_runtime_profile(const common_params & params) {
+    if (!server_gfx1030_native_auto_enabled() ||
+            !server_vocab_sharded_output_enabled() ||
+            !server_env_enabled("SPEC_SIDECAR") ||
+            params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        return false;
+    }
+
+    size_t n_rocm_devices = 0;
+    for (ggml_backend_dev_t device : params.devices) {
+        if (device == nullptr) continue;
+        const char * name = ggml_backend_dev_name(device);
+        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                name == nullptr || std::strncmp(name, "ROCm", 4) != 0) {
+            return false;
+        }
+        ++n_rocm_devices;
+    }
+    return n_rocm_devices == 4;
+}
+
+static bool server_mtp_deferred_catchup_enabled() {
+    return server_spec_mtp_deferred_setting_enabled(
+            std::getenv("GGML_MTP_DEFER_CATCHUP"));
+}
+
+static bool server_gfx1030_content_stacked_profile(const common_params & params) {
+    return server_gfx1030_sidecar_runtime_profile(params) &&
+            params.n_parallel == 1 &&
+            params.speculative.draft.sidecar_candidate_ready &&
+            params.speculative.draft.sidecar_profile_name == "qwen35-mtp" &&
+            server_spec_content_stacked_verification_profile(params.speculative) &&
+            !params.speculative.has_synth() &&
+            server_mtp_deferred_catchup_enabled();
+}
+
+static bool server_gfx1030_dflash_dynamic_depth_profile(const common_params & params) {
+    return server_gfx1030_sidecar_runtime_profile(params) &&
+            server_spec_gfx1030_dflash_dynamic_depth_profile(params.speculative) &&
+            params.n_parallel >= 1 && params.n_parallel <= 4;
+}
+
+static bool server_greedy_backend_sampling_eligible(const common_params_sampling & sampling) {
+    if (sampling.samplers.empty() || sampling.samplers.back() != COMMON_SAMPLER_TYPE_TEMPERATURE) {
+        return false;
+    }
+    for (common_sampler_type sampler : sampling.samplers) {
+        switch (sampler) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+            case COMMON_SAMPLER_TYPE_DRY:
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+            case COMMON_SAMPLER_TYPE_TOP_K:
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+            case COMMON_SAMPLER_TYPE_TOP_P:
+            case COMMON_SAMPLER_TYPE_MIN_P:
+            case COMMON_SAMPLER_TYPE_XTC:
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                break;
+            default:
+                return false;
+        }
+    }
+
+    const bool has_reasoning_budget =
+        !sampling.reasoning_budget_start.empty() && !sampling.reasoning_budget_end.empty() &&
+        (sampling.grammar_lazy || sampling.reasoning_budget_tokens >= 0 || sampling.reasoning_control);
+
+    return sampling.temp <= 0.0f && sampling.dynatemp_range == 0.0f &&
+        sampling.top_k <= 0 && sampling.top_p >= 1.0f && sampling.min_p <= 0.0f &&
+        sampling.typ_p >= 1.0f && sampling.top_n_sigma < 0.0f &&
+        sampling.xtc_probability <= 0.0f && sampling.mirostat == 0 &&
+        sampling.adaptive_target < 0.0f && sampling.penalty_repeat == 1.0f &&
+        sampling.penalty_freq == 0.0f && sampling.penalty_present == 0.0f &&
+        sampling.dry_multiplier == 0.0f && !sampling.ignore_eos && sampling.min_keep == 0 &&
+        sampling.n_probs == 0 && sampling.logit_bias.empty() && sampling.grammar.empty() &&
+        !has_reasoning_budget;
+}
+
+enum class server_auto_spec_target_backend_sampling_mode {
+    NONE,
+    GREEDY,
+    STOCHASTIC,
+};
+
+static server_auto_spec_target_backend_sampling_mode server_auto_spec_target_backend_sampling(
+        const common_params & params, const common_params_sampling & sampling, const llama_vocab * vocab) {
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+
+    const auto profile = server_spec_target_backend_profile_select(params.speculative);
+    if (!server_gfx1030_spec_target_backend_sampling_profile(params) || !profile ||
+            llama_vocab_n_tokens(vocab) < 65536 || n_suppress != 0) {
+        return server_auto_spec_target_backend_sampling_mode::NONE;
+    }
+
+    if (server_greedy_backend_sampling_eligible(sampling)) {
+        return server_auto_spec_target_backend_sampling_mode::GREEDY;
+    }
+    if (server_spec_target_backend_profile_allows_stochastic_auto(profile) &&
+            server_env_enabled("GGML_HIP_GFX1030_STOCHASTIC_TARGET_BACKEND_SAMPLING") &&
+            server_spec_target_backend_sampling_stochastic_eligible(sampling)) {
+        return server_auto_spec_target_backend_sampling_mode::STOCHASTIC;
+    }
+
+    return server_auto_spec_target_backend_sampling_mode::NONE;
+}
+
+static bool server_sampler_chain_backend_fully_supported(llama_sampler * chain) {
+    if (chain == nullptr || llama_sampler_chain_get(chain, -1) == nullptr) {
+        return false;
+    }
+
+    for (int i = 0; i < llama_sampler_chain_n(chain); ++i) {
+        llama_sampler * sampler = llama_sampler_chain_get(chain, i);
+        const char * name = sampler != nullptr ? llama_sampler_name(sampler) : nullptr;
+        if (name == nullptr || name[0] == '-') {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -294,10 +512,17 @@ struct server_slot {
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
+    std::vector<common_speculative_token_dist> spec_dists;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    bool spec_grammar_fallback_logged = false;
+    // True only while the sidecar cursor still describes this slot's resident
+    // target prompt. Host prompt-cache and slot-file restores replace target KV
+    // without restoring the sidecar's private device KV.
+    bool spec_prompt_state_valid = true;
+    bool spec_n_max_user_override = false;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -339,33 +564,91 @@ struct server_slot {
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
-        if (prompt.tokens.size() == 0) {
+        if (prompt.tokens.size() == 0 || prompt_cache.contains(prompt)) {
             return false;
         }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+        // The optional sidecar attention-window snapshot keeps cache switching
+        // from replaying the whole prompt to reseed the drafter KV.
+        size_t cur_size_spec = 0;
+        if (spec) {
+            const int32_t spec_size = common_speculative_kv_state_size(spec, id);
+            if (spec_size >= 0) {
+                cur_size_spec = (size_t) spec_size;
+            }
+        }
 
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+        const size_t cur_size = cur_size_tgt + cur_size_dft + cur_size_spec;
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB, spec: %.3f MiB)\n",
+                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0), cur_size_spec / (1024.0 * 1024.0));
+
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, cur_size_spec);
         if (cur == nullptr) {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_tgt = llama_state_seq_get_data_ext(
+            ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n_tgt != cur_size_tgt) {
+            SLT_WRN(*this, "failed to save target prompt state: expected %zu bytes, got %zu\n",
+                    cur_size_tgt, n_tgt);
+            if (!prompt_cache.discard(cur)) {
+                SLT_ERR(*this, "%s", "failed to discard incomplete target prompt state\n");
+            }
+            return false;
+        }
+
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t n_dft = llama_state_seq_get_data_ext(
+                ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n_dft != cur_size_dft) {
+                SLT_WRN(*this, "failed to save draft prompt state: expected %zu bytes, got %zu\n",
+                        cur_size_dft, n_dft);
+                if (!prompt_cache.discard(cur)) {
+                    SLT_ERR(*this, "%s", "failed to discard incomplete draft prompt state\n");
+                }
+                return false;
+            }
+        }
+
+        if (cur_size_spec > 0) {
+            if (!common_speculative_get_kv_state(spec, id, cur->data.spec)) {
+                SLT_WRN(*this, "%s", "failed to save speculative sidecar KV snapshot; dropping cache entry\n");
+                if (!prompt_cache.discard(cur)) {
+                    SLT_ERR(*this, "%s", "failed to discard incomplete prompt state\n");
+                }
+                return false;
+            }
         }
 
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        const bool replaces_resident_state = prompt_cache.has_better_match(prompt, tokens);
+        std::vector<uint8_t> spec_data;
+        if (spec) {
+            const auto * best = prompt_cache.find_better_match(prompt, tokens);
+            if (best != nullptr) {
+                spec_data = best->data.spec;
+            }
+        }
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        if (replaces_resident_state) {
+            spec_prompt_state_valid = false;
+        }
+        if (res && spec != nullptr && !spec_data.empty()) {
+            if (common_speculative_set_kv_state(spec, id, spec_data)) {
+                // The restored sidecar window pairs with the restored target KV.
+                spec_prompt_state_valid = true;
+            } else {
+                SLT_WRN(*this, "%s", "failed to restore speculative sidecar KV; replaying prompt\n");
+            }
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -379,6 +662,10 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+        if (can_speculate()) {
+            common_speculative_reset_state(spec, id);
+        }
+        spec_prompt_state_valid = true;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -388,6 +675,8 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    llama_sampler_ptr  smpl_backend_greedy;
+    bool               smpl_backend_greedy_attached = false;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -417,6 +706,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_grammar_fallback_logged = false;
+        spec_n_max_user_override = false;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -427,13 +718,19 @@ struct server_slot {
         n_sent_text    = 0;
 
         if (can_speculate()) {
+            // Keep implementation state only when it can remain tied to this
+            // slot's resident target prompt. MTP validates that relationship at
+            // the next request; other implementations retain reset-on-release.
+            common_speculative_release_state(spec, id);
             spec_draft.clear();
+            spec_dists.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
+
 
         task_prev = std::move(task);
         task.reset();
@@ -444,7 +741,17 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        // The automatic speculative target chain is stateless. Keep it attached
+        // across compatible requests so that the target context can reuse its
+        // existing scheduler reservation instead of rebuilding the PP/TG/PP
+        // reserve graphs for every request.
+        if (smpl_backend_greedy_attached) {
+            GGML_ASSERT(smpl_backend_greedy);
+            llama_sampler_reset(smpl_backend_greedy.get());
+        } else {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+            smpl_backend_greedy.reset();
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -578,6 +885,12 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
+        // Per-request cap; zero keeps the loaded speculator resident but skips it.
+        // An omitted override (-1) preserves the configured speculator defaults.
+        if (task->params.speculative_n_max >= 0) {
+            n_draft_max = std::min(n_draft_max, task->params.speculative_n_max);
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
@@ -660,6 +973,23 @@ struct server_slot {
                 prompt_clear();
             }
 
+            // erase generation-phase checkpoints (pos > prompt) to free slots for next request's input-phase checkpoints
+            if (!task->is_child()) {
+                auto prompt_end = task->n_tokens();
+                int erased = 0;
+                for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
+                    if (it->pos_min > prompt_end) {
+                        SLT_DBG(*this, "release: erasing generation checkpoint (pos_min=%d > prompt_end=%d)\n", it->pos_min, prompt_end);
+                        it = prompt.checkpoints.erase(it);
+                        erased++;
+                    } else {
+                        ++it;
+                    }
+                }
+                if (erased > 0) {
+                    SLT_INF(*this, "release: erased %d generation checkpoints (prompt_end=%d)\n", erased, prompt_end);
+                }
+            }
             callback_on_reset(*this);
 
             reset();
@@ -786,9 +1116,11 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+        } else if (can_speculate()) {
+            SLT_INF(*this, "draft activity = 0 tokens (%d verification steps)\n", n_draft_verif_steps);
         }
 
-        common_speculative_print_stats(spec);
+        common_speculative_print_stats(spec, id);
     }
 
     json to_json(bool only_metrics = false) const {
@@ -846,6 +1178,8 @@ struct server_slot {
         other.stats = stats;
 
         other.prompt = prompt.clone();
+        // Target KV was copied, but a sidecar's private per-sequence KV was not.
+        other.spec_prompt_state_valid = false;
         other.init_sampler();
     }
 };
@@ -1056,6 +1390,7 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+    int32_t gfx1030_neural_k4v_cycle_cap = -1;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -1105,6 +1440,11 @@ private:
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
+
+    // hybrid/recurrent models need re-evaluation of accepted tokens after
+    // rejecting draft tokens, because the recurrent state cannot be rolled back
+    bool needs_reeval = false;
+    int  n_parallel_user = 0;
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -1190,6 +1530,26 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        // Sidecar probing can infer MTP/DFlash from the supplied GGUF. Do this
+        // before computing output limits so an auto-detected type reserves the
+        // same target buffers as an explicit --spec-type.
+        const bool sidecar_candidate = common_speculative_sidecar_candidate(
+                params_base.speculative, params_base.model.path,
+                (uint32_t) params_base.n_parallel);
+        params_base.speculative.draft.content_verification_eligible = sidecar_candidate &&
+                server_gfx1030_content_stacked_profile(params_base);
+        const bool content_mtp_stack =
+                std::find(params_base.speculative.types.begin(),
+                          params_base.speculative.types.end(),
+                          COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end() &&
+                std::find(params_base.speculative.types.begin(),
+                          params_base.speculative.types.end(),
+                          COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V) != params_base.speculative.types.end();
+        if (sidecar_candidate && content_mtp_stack &&
+                common_speculative_content_env_enabled() &&
+                !params_base.speculative.draft.content_verification_eligible) {
+            SRV_WRN("%s", "content stacked verification disabled: requires one K4V plus the qwen35 MTP sidecar on the gfx1030 TP4 tensor-split, sharded-output, --parallel 1, baseline-width-4, deferred-catch-up profile; DFlash remains fixed after a negative K4V5 screen\n");
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1199,7 +1559,9 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        // A sidecar-only DFlash invocation may intentionally omit -md: the
+        // ABI/artifact probe is enough to establish the speculative stage.
+        const bool has_spec = has_draft || spec_mtp || sidecar_candidate;
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1284,7 +1646,39 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // Dynamic sampler attachment currently requires the backend-sampling
+        // output buffers to exist before the first graph reserve. Prime those
+        // buffers for the validated automatic speculative profile, then restore
+        // the user default so request-level eligibility still controls activation.
+        const auto auto_profile = server_spec_target_backend_profile_select(params_base.speculative);
+        const bool backend_sampling_default = params_base.sampling.backend_sampling;
+        const bool prime_auto_backend_sampling = !backend_sampling_default &&
+            server_gfx1030_spec_target_backend_sampling_profile(params_base) &&
+            (server_greedy_backend_sampling_eligible(params_base.sampling) ||
+             (server_spec_target_backend_profile_allows_stochastic_auto(auto_profile) &&
+              server_env_enabled("GGML_HIP_GFX1030_STOCHASTIC_TARGET_BACKEND_SAMPLING") &&
+              server_spec_target_backend_sampling_stochastic_eligible(params_base.sampling)));
+        if (prime_auto_backend_sampling) {
+            params_base.sampling.backend_sampling = true;
+            SRV_INF("%s", "reserving target backend-sampling buffers for gfx1030 speculative auto policy\n");
+        }
+
+        if (server_gfx1030_dflash_dynamic_depth_profile(params_base) &&
+                std::getenv("LLAMA_SPEC_DFLASH_DYNAMIC_DEPTH") == nullptr) {
+#if defined(_WIN32)
+            _putenv_s("LLAMA_SPEC_DFLASH_DYNAMIC_DEPTH", "batch");
+#else
+            setenv("LLAMA_SPEC_DFLASH_DYNAMIC_DEPTH", "batch", 0);
+#endif
+            SRV_INF("%s", "enabling active-batch DFlash depth schedule for qualified gfx1030 TP4 sidecar; "
+                    "set LLAMA_SPEC_DFLASH_DYNAMIC_DEPTH=off to disable\n");
+        }
+
         llama_init = common_init_from_params(params_base);
+
+        if (prime_auto_backend_sampling) {
+            params_base.sampling.backend_sampling = backend_sampling_default;
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1308,6 +1702,31 @@ private:
             return false;
         }
 
+        gfx1030_neural_k4v_cycle_cap = server_gfx1030_neural_k4v_cycle_cap(params_base);
+        if (gfx1030_neural_k4v_cycle_cap > 0) {
+            const bool is_mtp = std::find(params_base.speculative.types.begin(),
+                                          params_base.speculative.types.end(),
+                                          COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+            if (params_base.speculative.draft.content_verification_eligible &&
+                    common_speculative_content_env_enabled()) {
+                SRV_INF("keeping automatic gfx1030 %s generation at %d while content-gating K4V "
+                        "from %d through %d draft tokens (configured K4V m=%u); "
+                        "explicit request speculative.n_max still overrides\n",
+                        is_mtp ? "MTP" : "DFlash", gfx1030_neural_k4v_cycle_cap,
+                        gfx1030_neural_k4v_cycle_cap,
+                        gfx1030_neural_k4v_cycle_cap + common_speculative_content_env_max_boost(),
+                        params_base.speculative.ngram_map_k4v.size_m);
+            } else {
+                SRV_INF("capping automatic gfx1030 %s+K4V cycles at %d draft tokens "
+                        "(configured K4V m=%u); explicit request speculative.n_max overrides\n",
+                        is_mtp ? "MTP" : "DFlash", gfx1030_neural_k4v_cycle_cap,
+                        params_base.speculative.ngram_map_k4v.size_m);
+            }
+        }
+
+        needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+        n_parallel_user = params_base.n_parallel;
+
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
@@ -1324,22 +1743,29 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                spec_init = common_speculative_init_from_params(
+                        params_dft, model_tgt, ctx_tgt);
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
+                const bool sidecar_only = spec_init->sidecar_only();
 
-                if (has_draft && model_dft == nullptr) {
+                if (has_draft && model_dft == nullptr && !sidecar_only) {
                     SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                     return false;
                 }
 
-                if (ctx_dft == nullptr) {
+                if (ctx_dft == nullptr && !sidecar_only) {
                     SRV_ERR("%s", "failed to create MTP context\n");
                     return false;
                 }
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
+                params_base.speculative.draft.sidecar_only = sidecar_only;
+                params_base.speculative.draft.sidecar_type = sidecar_only
+                        ? spec_init->sidecar_type() : COMMON_SPECULATIVE_TYPE_NONE;
+                params_base.speculative.draft.sidecar_profile = sidecar_only
+                        ? params_dft.speculative.draft.sidecar_profile : nullptr;
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
@@ -1585,6 +2011,26 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        // Honor the explicit checkpoint count on every backend. AMD restore remains
+        // experimental (issue #20176), so warn when the user enables it but do
+        // not silently override --ctx-checkpoints.
+        if (params_base.n_ctx_checkpoints > 0) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+                std::string name = ggml_backend_dev_name(dev);
+                if (name.find("AMD") != std::string::npos ||
+                    name.find("Radeon") != std::string::npos ||
+                    name.find("ROCm") != std::string::npos) {
+                    SRV_WRN("AMD GPU detected (%s) — context checkpoints explicitly enabled (max=%d, issue #20176); use --ctx-checkpoints 0 to disable\n",
+                            name.c_str(), params_base.n_ctx_checkpoints);
+                    break;
+                }
+            }
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
@@ -1767,6 +2213,39 @@ private:
         return nullptr;
     }
 
+    // Shrink recurrent state to 1 cell before saving/loading prompt cache.
+    // This frees GPU memory for the cache and ensures a clean recurrent state
+    // that matches the loaded KV cache. The subsequent expand restores capacity.
+    bool recurrent_shrink_for_prompt_cache() {
+        if (!needs_reeval || n_parallel_user > 1) {
+            return true;
+        }
+
+        if (llama_context_recurrent_shrink(ctx_tgt, 1)) {
+            SRV_INF("%s", "shrunk recurrent state to 1 cell for prompt cache\n");
+            return true;
+        }
+
+        SRV_ERR("failed to shrink recurrent state (%s)\n", "prompt cache");
+        return false;
+    }
+
+    // Expand recurrent state back after prompt cache save/load completes.
+    void recurrent_expand_after_prompt_cache() {
+        if (!needs_reeval || n_parallel_user > 1) {
+            return;
+        }
+
+        // Expand to n_parallel_user cells (the original allocation from model init).
+        // Context checkpoints will be re-created after this, referencing the new cells.
+        if (llama_context_recurrent_expand(ctx_tgt, n_parallel_user)) {
+            SRV_INF("expanded recurrent state to %d cells after prompt cache\n", n_parallel_user);
+            return;
+        }
+
+        SRV_ERR("failed to expand recurrent state (%s)\n", "prompt cache");
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1851,6 +2330,63 @@ private:
         }
 
         if (ret) {
+            // Single-slot text recurrent contexts can avoid a host round-trip in
+            // two exact-semantics cases: the incoming prompt extends the resident
+            // state, or the normal slot policy has no branch to preserve and the
+            // host cache has no better state to load. Keep multi-slot, multimedia,
+            // adapter-backed state, explicit cache bypasses, and actual branch
+            // switches on the proven shrink/save/load/expand path.
+            const bool has_adapter_state =
+                !params_base.lora_adapters.empty() ||
+                !ret->lora.empty() ||
+                !task.params.lora.empty();
+
+            const bool can_probe_recurrent_cache =
+                needs_reeval &&
+                n_parallel_user == 1 &&
+                prompt_cache &&
+                task.type == SERVER_TASK_TYPE_COMPLETION &&
+                task.params.cache_prompt &&
+                !has_adapter_state &&
+                !ret->prompt.tokens.empty() &&
+                !ret->prompt.tokens.has_mtmd &&
+                !task.tokens.has_mtmd;
+
+            const bool reuse_recurrent_in_place =
+                can_probe_recurrent_cache &&
+                server_prompt_cache_can_reuse_in_place(
+                    ret->prompt.tokens, task.tokens, task.params.cache_prompt);
+
+            const bool has_better_cached_prompt =
+                can_probe_recurrent_cache &&
+                !reuse_recurrent_in_place &&
+                !update_cache &&
+                prompt_cache->has_better_match(ret->prompt, task.tokens);
+
+            const bool skip_redundant_recurrent_update =
+                server_prompt_cache_can_skip_recurrent_update(
+                    can_probe_recurrent_cache,
+                    update_cache,
+                    reuse_recurrent_in_place,
+                    has_better_cached_prompt);
+
+            if (skip_redundant_recurrent_update) {
+                update_cache = false;
+                if (reuse_recurrent_in_place) {
+                    SRV_TRC("reusing recurrent prompt in place; skipping host prompt-cache update "
+                            "(resident = %zu tokens, incoming = %zu tokens)\n",
+                            ret->prompt.tokens.size(), task.tokens.size());
+                } else {
+                    SRV_TRC("keeping resident recurrent prompt; no branch save or better host-cache "
+                            "state is needed (resident = %zu tokens, incoming = %zu tokens)\n",
+                            ret->prompt.tokens.size(), task.tokens.size());
+                }
+            } else if (needs_reeval && prompt_cache) {
+                // Recurrent models need shrink/restore when switching prompt
+                // states to avoid forced full re-processing (issue #22746).
+                update_cache = true;
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for the tasks that reuse them
@@ -1860,16 +2396,34 @@ private:
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
+                const bool shrink_ok = recurrent_shrink_for_prompt_cache();
+                const int64_t t_shrink = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                const bool saved = ret->prompt_save(*prompt_cache);
+                const int64_t t_save = ggml_time_us();
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                const bool load_ok = ret->prompt_load(*prompt_cache, task.tokens);
+                const int64_t t_load = ggml_time_us();
+                if (!load_ok) {
                     ret->prompt_clear();
                 }
 
                 prompt_cache->update();
+                const int64_t t_update = ggml_time_us();
 
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                recurrent_expand_after_prompt_cache();
+                const int64_t t_end = ggml_time_us();
+
+                SRV_TRC("prompt cache update took %.2f ms "
+                        "(shrink %.2f, save %.2f, load %.2f, update %.2f, expand %.2f; "
+                        "shrink_ok = %d, saved = %d, load_ok = %d)\n",
+                        (t_end    - t_start)  / 1000.0,
+                        (t_shrink - t_start)  / 1000.0,
+                        (t_save   - t_shrink) / 1000.0,
+                        (t_load   - t_save)   / 1000.0,
+                        (t_update - t_load)   / 1000.0,
+                        (t_end    - t_update) / 1000.0,
+                        shrink_ok, saved, load_ok);
             }
         }
 
@@ -1930,6 +2484,7 @@ private:
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
                     slot.prompt.clear();
+                    slot.spec_prompt_state_valid = false;
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -2010,6 +2565,28 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
+            slot.spec_n_max_user_override = task.params.speculative_n_max >= 0;
+            if (!slot.spec_n_max_user_override && gfx1030_neural_k4v_cycle_cap > 0) {
+                task.params.speculative_n_max = server_sidecar_content_boost_enabled(params_base)
+                        ? gfx1030_neural_k4v_cycle_cap + common_speculative_content_env_max_boost()
+                        : gfx1030_neural_k4v_cycle_cap;
+            }
+
+            // The automatic gfx1030 K4V envelope is not a user override.
+            // It reserves base+boost for K4V/target verification only; neural
+            // providers still clamp to their configured width. Preserve the
+            // existing target backend-sampling profile for this internal cap.
+            const auto auto_backend_sampling_mode = !task.params.backend_sampling_set &&
+                !task.params.sampling.backend_sampling &&
+                server_spec_auto_backend_width_eligible(
+                    task.params.speculative_n_max,
+                    slot.spec_n_max_user_override,
+                    gfx1030_neural_k4v_cycle_cap,
+                    params_base.speculative.draft.n_max)
+                ? server_auto_spec_target_backend_sampling(params_base, task.params.sampling, vocab)
+                : server_auto_spec_target_backend_sampling_mode::NONE;
+            const bool auto_backend_sampling =
+                auto_backend_sampling_mode != server_auto_spec_target_backend_sampling_mode::NONE;
             try {
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {
@@ -2020,19 +2597,71 @@ private:
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
+            bool use_backend_sampling = task.params.sampling.backend_sampling || auto_backend_sampling;
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
+            if (use_backend_sampling && server_vocab_sharded_output_enabled() &&
+                    !params_base.sampling.backend_sampling) {
+                SLT_WRN(slot, "%s", "vocabulary-sharded target output is incompatible with backend sampling; using CPU fallback\n");
+                use_backend_sampling = false;
+                task.params.sampling.backend_sampling = false;
+            }
 
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                llama_sampler * backend_sampler = common_sampler_get(slot.smpl.get());
+                if (auto_backend_sampling_mode == server_auto_spec_target_backend_sampling_mode::GREEDY) {
+                    if (!slot.smpl_backend_greedy) {
+                        slot.smpl_backend_greedy.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                        llama_sampler_chain_add(slot.smpl_backend_greedy.get(), llama_sampler_init_temp(0.0f));
+                        llama_sampler_chain_add(slot.smpl_backend_greedy.get(), llama_sampler_init_greedy());
+                    } else {
+                        llama_sampler_reset(slot.smpl_backend_greedy.get());
+                    }
+                    backend_sampler = slot.smpl_backend_greedy.get();
+                }
+
+                const bool reuse_greedy_sampler =
+                    auto_backend_sampling_mode == server_auto_spec_target_backend_sampling_mode::GREEDY &&
+                    slot.smpl_backend_greedy_attached;
+                if (!reuse_greedy_sampler) {
+                    use_backend_sampling = llama_set_sampler(ctx_tgt, slot.id, backend_sampler);
+                }
+
+                // Automatic stochastic mode must be fully backend-executable.
+                // Partial prefix offload is valid for explicit requests, but it
+                // would make the claimed automatic E2E optimization ambiguous.
+                if (use_backend_sampling &&
+                        auto_backend_sampling_mode == server_auto_spec_target_backend_sampling_mode::STOCHASTIC &&
+                        !server_sampler_chain_backend_fully_supported(backend_sampler)) {
+                    SLT_WRN(slot, "%s", "automatic backend sampling unavailable for the complete stochastic sampler chain; using CPU fallback\n");
+                    use_backend_sampling = false;
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                    slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                }
+
+                if (!use_backend_sampling) {
+                    task.params.sampling.backend_sampling = false;
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                    slot.smpl_backend_greedy_attached = false;
+                } else if (auto_backend_sampling_mode == server_auto_spec_target_backend_sampling_mode::GREEDY) {
+                    slot.smpl_backend_greedy_attached = true;
+                    task.params.sampling.backend_sampling = true;
+                    SLT_INF(slot, "%s", "using automatic gfx1030 backend target sampling for greedy speculative decode\n");
+                } else if (auto_backend_sampling_mode == server_auto_spec_target_backend_sampling_mode::STOCHASTIC) {
+                    slot.smpl_backend_greedy_attached = false;
+                    task.params.sampling.backend_sampling = true;
+                    SLT_INF(slot, "%s", "using automatic gfx1030 backend sampling for stochastic speculative decode\n");
+                } else {
+                    slot.smpl_backend_greedy_attached = false;
+                }
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.smpl_backend_greedy_attached = false;
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -2045,6 +2674,8 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
         } else {
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            slot.smpl_backend_greedy_attached = false;
             slot.smpl.reset();
         }
 
@@ -3239,6 +3870,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->spec_prompt_state_valid = false;
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3672,8 +4304,18 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+                // The sidecar has an absolute-position KV array, whereas the
+                // native memory abstraction changes positions in-place. Move
+                // the live sidecar range before rewriting prompt.tokens; its
+                // epoch invalidation makes older checkpoints fail closed.
+                const llama_pos sidecar_pos_max = llama_memory_seq_pos_max(
+                        llama_get_memory(slot.ctx_tgt), slot.id) + 1;
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                if (slot.can_speculate() && !common_speculative_rebase_state(
+                            spec.get(), slot.id, n_keep + n_discard, sidecar_pos_max, -n_discard)) {
+                    SLT_WRN(slot, "%s", "speculative sidecar rebase failed; continuing target-only\n");
+                }
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3761,6 +4403,7 @@ private:
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
+                            /* .n_max_user_override = */ slot.spec_n_max_user_override,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
@@ -3768,6 +4411,8 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .dists = */ &slot.spec_dists,
+                            /* .temperature = */ slot.task->params.sampling.temp,
                         };
 
                         drafting.push_back(&slot);
@@ -3798,7 +4443,9 @@ private:
                     GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                // The draft cache has one dense row per token. M-RoPE target pos_max can be smaller
+                // than the token count because image spans repeat their temporal position.
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, (llama_pos) ckpt.n_tokens, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
             }
@@ -3828,6 +4475,12 @@ private:
                 if (use_ckpt_dft) {
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
+
+                // Capture the sidecar cursor at the same logical boundary as
+                // the target/draft checkpoint. This is a tiny host snapshot;
+                // it does not copy the sidecar's device KV cache.
+                ckpt.data_spec.clear();
+                common_speculative_get_state(spec.get(), slot.id, ckpt.data_spec);
             }
         });
 
@@ -3903,6 +4556,7 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        int n_past_common = 0;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3970,6 +4624,7 @@ private:
                             if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                n_past_common = n_past;
 
                                 // the children start from the shared prefix, do not go past it
                                 if (slot.task->n_tokens_shared > 0) {
@@ -4049,7 +4704,36 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+
+                                // The automatic path does not serialize a replacement checkpoint
+                                // below. Drop checkpoints from an older prompt so that a later
+                                // cache-enabled request cannot restore stale recurrent state.
+                                if (slot.smpl_backend_greedy_attached) {
+                                    slot.prompt.checkpoints.clear();
+                                }
                             }
+
+                            // The MTP sidecar can reuse device KV only when the new
+                            // prompt is a strict linear extension of the exact
+                            // resident target prefix. A host-cache restore, branch,
+                            // same-prompt logits replay, or chunk shift requires one
+                            // full target replay to reconstruct sidecar KV safely.
+                            const bool can_reuse_resident_spec_state =
+                                    slot.spec_prompt_state_valid &&
+                                    slot.task->params.cache_prompt &&
+                                    n_past == n_past_common &&
+                                    n_past == slot.prompt.n_tokens() &&
+                                    n_past < slot.task->n_tokens();
+                            const llama_pos resident_pos_next = slot.prompt.tokens.pos_next(n_past);
+                            if (slot.can_speculate() && !common_speculative_prepare_prompt_state(
+                                        spec.get(), slot.id, resident_pos_next, can_reuse_resident_spec_state)) {
+                                SLT_DBG(slot, "replaying full prompt to synchronize speculative sidecar (cached=%d, resident=%d, incoming=%d)\n",
+                                        n_past, slot.prompt.n_tokens(), slot.task->n_tokens());
+                                n_past = 0;
+                                n_past_common = 0;
+                                slot.prompt.checkpoints.clear();
+                            }
+                            slot.spec_prompt_state_valid = true;
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
@@ -4149,11 +4833,14 @@ private:
 
                                     if (!do_reset) {
                                         // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        if (!common_speculative_set_state(spec.get(), slot.id, it->data_spec)) {
+                                            SLT_WRN(slot, "%s", "speculative sidecar state restore failed; continuing target-only\n");
+                                        }
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        n_past_common = std::min(n_past_common, (int) it->n_tokens);
+                                        SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
                                     if (do_reset) {
@@ -4161,6 +4848,7 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                        n_past_common = 0;
                                     }
                                 }
                             }
@@ -4183,6 +4871,9 @@ private:
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
+                            // Keep the prompt-token history aligned with the KV
+                            // cache after reserving one token for logits.
+                            n_past_common = std::min(n_past_common, n_past);
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
@@ -4191,7 +4882,7 @@ private:
 
                         metrics.add_prompt_cached(n_past);
 
-                        slot.prompt.tokens.keep_first(n_past);
+                        slot.prompt.tokens.keep_first(std::max((size_t)n_past_common, (size_t)n_past));
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -4221,7 +4912,7 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    slot.mem.seq_rm(slot.id, p0, -1, (llama_pos) slot.prompt.n_tokens());
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -4450,7 +5141,13 @@ private:
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
-                    if (do_checkpoint) {
+                    // Keep the same prompt chunk boundaries because recurrent/speculative
+                    // models can depend on them. On the structurally certified stateless
+                    // automatic-greedy path, however, a request that explicitly disabled
+                    // prompt-cache reuse does not need this expensive serialized checkpoint.
+                    const bool skip_unused_auto_checkpoint =
+                        slot.smpl_backend_greedy_attached && !slot.task->params.cache_prompt;
+                    if (do_checkpoint && !skip_unused_auto_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
                 }
@@ -4541,7 +5238,7 @@ private:
 
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
-        if (spec && batch.has_embd()) {
+        if (spec && batch.has_embd() && model_dft != nullptr) {
             if (llama_model_n_embd_inp(model_dft) != llama_model_n_embd_inp(model_tgt)) {
                 SRV_ERR("%s", "unsupported batch.has_embd + spec case\n");
                 throw std::runtime_error("unsupported batch.has_embd + spec case");
@@ -4662,7 +5359,28 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {
-        // for checking if a given batch index is inside the current sub-batch
+        // Commit target rows that are unconditionally accepted (prompt rows and
+        // ordinary one-token generation). Speculative verification commits its
+        // accepted prefix later, after sampler rejection has completed.
+        auto commit_target_rows = [&](server_slot & slot) {
+            if (!slot.can_speculate()) {
+                return;
+            }
+            llama_pos pos_max = -1;
+            for (int32_t i = off; i < off + n_batch_tokens; ++i) {
+                if (batch.tokens[i].id_slot != slot.id) {
+                    continue;
+                }
+                pos_max = std::max(pos_max, batch.tokens[i].pos[0] + 1);
+            }
+            if (pos_max < 0 || !common_speculative_commit_state(spec.get(), slot.id, pos_max)) {
+                if (pos_max >= 0) {
+                    SLT_WRN(slot, "%s", "speculative sidecar target commit failed; continuing target-only\n");
+                }
+            }
+        };
+
+        // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
         };
@@ -4688,6 +5406,10 @@ private:
                 if (slot.task->params.stream && slot.task->params.return_progress) {
                     send_partial_response(slot, {}, true);
                 }
+            }
+
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+                commit_target_rows(slot);
             }
 
             if (!is_inside_view(slot.i_batch)) {
@@ -4746,6 +5468,7 @@ private:
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
+            commit_target_rows(slot);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -4803,6 +5526,24 @@ private:
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                const bool can_rollback =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
+                const bool can_use_residual = synth_probs.empty() && can_rollback &&
+                                              slot.task->params.sampling.temp > 0.0f &&
+                                              slot.spec_dists.size() == slot.spec_draft.size();
+                const bool grammar_active = common_sampler_grammar_should_apply(slot.smpl.get());
+
+                // Distribution-aware speculative verification applies grammar_first to every target
+                // row. For large tool grammars this scans the full vocabulary up to n_draft times and
+                // leaves the GPUs idle. Equality verification is still target-distribution-correct and
+                // uses the inexpensive rejection-sampling grammar path, matching native MTP behavior.
+                const bool use_residual = can_use_residual && !grammar_active;
+                if (can_use_residual && grammar_active && !slot.spec_grammar_fallback_logged) {
+                    SLT_INF(slot, "%s", "using equality speculative verification while grammar constraints are active\n");
+                    slot.spec_grammar_fallback_logged = true;
+                }
+
 
                 // drafters that fill no distribution fall back here
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
@@ -4815,6 +5556,8 @@ private:
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                } else if (use_residual) {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_dists);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
@@ -4839,6 +5582,7 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        slot.spec_dists.clear();
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -4849,8 +5593,11 @@ private:
                         if (slot.ctx_dft) {
                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                         }
+                        if (!common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec)) {
+                            SLT_WRN(slot, "%s", "speculative sidecar rollback state restore failed; continuing target-only\n");
+                        }
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1, (llama_pos) ckpt.n_tokens);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -4863,9 +5610,14 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                const uint16_t n_committed = (uint16_t) (accepted.size() - 1);
+                const uint16_t n_accepted_draft = n_committed -
+                        (slot.spec_is_replay && n_committed > 0 ? 1 : 0);
+                common_speculative_accept(
+                        spec.get(), slot.id, n_committed, n_accepted_draft);
 
                 slot.spec_draft = std::move(accepted);
+                slot.spec_dists.clear();
             }
 
             const auto ids = std::move(slot.spec_draft);
@@ -4897,7 +5649,7 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1, (llama_pos) slot.prompt.n_tokens());
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -5525,7 +6277,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
     task_params tparams;
-    tparams.sampling = params.sampling;
+    tparams.sampling    = params.sampling;
+    tparams.speculative = params.speculative;
     json default_generation_settings_for_props = json {
         { "params", tparams.to_json(true) },
         { "n_ctx",  meta.slot_n_ctx },

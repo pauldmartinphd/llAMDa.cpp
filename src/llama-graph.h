@@ -1117,7 +1117,8 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+                      bool   force_fp32_allreduce = false) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
@@ -1293,6 +1294,7 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+    llm_graph_input_attn_kv * build_attn_inp_kv(const llama_kv_cache_context * mctx_cur) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
@@ -1468,6 +1470,8 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    virtual void build_post_sampling() const {}
 
     //
     // dense (out)

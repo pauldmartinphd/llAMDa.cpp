@@ -68,6 +68,8 @@ extern "C" {
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
+    GGML_API bool                           ggml_backend_buffer_is_meta       (ggml_backend_buffer_t buffer);
+    GGML_API struct ggml_tensor *           ggml_backend_meta_get_simple_tensor(const struct ggml_tensor * tensor, size_t index);
 
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
@@ -210,6 +212,11 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Optional exact communication + consumer-prefix fusion. A true return means
+    // the caller must omit reshape/add/rms_norm/mul from the next subgraph.
+    typedef bool   (*ggml_backend_comm_allreduce_fused_prefix_t)(
+        void * comm_ctx, struct ggml_tensor ** tensors, struct ggml_tensor ** reshapes,
+        struct ggml_tensor ** adds, struct ggml_tensor ** rms_norms, struct ggml_tensor ** muls);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
@@ -225,6 +232,10 @@ extern "C" {
         const char * value;
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
+
+    // Temporarily pin an existing host allocation for backend transfers.
+    typedef bool (*ggml_backend_register_host_buffer_t)  (void * buffer, size_t size);
+    typedef void (*ggml_backend_unregister_host_buffer_t)(void * buffer);
 
     //
     // Backend registry
@@ -429,6 +440,13 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // Return one physical copy of a mirrored meta tensor together with the
+    // backend that owns it. Split and partial tensors deliberately fail: one
+    // physical shard does not represent their complete logical value.
+    GGML_API bool ggml_backend_meta_get_mirrored_tensor(
+        ggml_backend_t meta_backend, const struct ggml_tensor * meta_tensor, size_t index,
+        ggml_backend_t * simple_backend, const struct ggml_tensor ** simple_tensor);
 
     //
     // Utils

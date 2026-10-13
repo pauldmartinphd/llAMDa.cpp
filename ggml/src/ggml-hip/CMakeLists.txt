@@ -73,6 +73,24 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
+# RDNA Q4_K/Q5_K/Q6_K MMQ variants use aligned 128-bit LDS activation loads.
+# Compile the opt-in path only into its own template instances.
+if (CMAKE_HIP_ARCHITECTURES MATCHES "gfx11" OR GPU_TARGETS MATCHES "gfx11")
+    set(GGML_RDNA_MMQ_WIDE_LDS "RDNA3")
+else()
+    set(GGML_RDNA_MMQ_WIDE_LDS "RDNA2")
+endif()
+
+set_source_files_properties(../ggml-cuda/template-instances/mmq-instance-q4_k.cu PROPERTIES
+    COMPILE_DEFINITIONS "GGML_HIP_${GGML_RDNA_MMQ_WIDE_LDS}_Q4_K_MMQ_WIDE_LDS=1")
+set_source_files_properties(../ggml-cuda/template-instances/mmq-instance-q6_k.cu PROPERTIES
+    COMPILE_DEFINITIONS "GGML_HIP_${GGML_RDNA_MMQ_WIDE_LDS}_Q6_K_MMQ_WIDE_LDS=1")
+
+# Q5_K uses the same aligned LDS window at J=64; the J<64 scalar path remains
+# selected in device code.
+set_source_files_properties(../ggml-cuda/template-instances/mmq-instance-q5_k.cu PROPERTIES
+    COMPILE_DEFINITIONS "GGML_HIP_${GGML_RDNA_MMQ_WIDE_LDS}_Q5_K_MMQ_WIDE_LDS=1")
+
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
@@ -123,6 +141,12 @@ endif()
 
 if (CXX_IS_HIPCC)
     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE CXX)
+    # Windows uses the CXX workaround above instead of CMake's HIP compiler
+    # language, so CMAKE_HIP_FLAGS would otherwise be silently omitted from
+    # the .cu compile commands (for example, the AMDGPU unroll tuning flag).
+    if (WIN32 AND CMAKE_HIP_FLAGS)
+        set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES COMPILE_FLAGS "${CMAKE_HIP_FLAGS}")
+    endif()
     if (WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
         # CMake on Windows doesn't support the HIP language yet.
         # Therefore we workaround debug build's failure on HIP backend this way.
@@ -139,6 +163,30 @@ endif()
 
 if (GGML_HIP_RCCL)
     target_link_libraries(ggml-hip PRIVATE ggml-base roc::rccl)
+
+    # RCCL loads its versioned tuner ABI as a shared object. Build the guarded
+    # policy beside libggml-hip so the backend can discover it before
+    # ncclCommInitAll without a user-provided path or launch wrapper.
+    add_library(ggml-rccl-tuner-rdna2-v620 MODULE
+        rccl-tuner-v620.cpp
+        rccl-tuner-v6.h
+        rccl-tuner-policy.h
+    )
+    target_include_directories(ggml-rccl-tuner-rdna2-v620 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(ggml-rccl-tuner-rdna2-v620 PRIVATE cxx_std_17)
+    target_link_libraries(ggml-rccl-tuner-rdna2-v620 PRIVATE hip::host)
+    add_dependencies(ggml-hip ggml-rccl-tuner-rdna2-v620)
+    set_target_properties(ggml-rccl-tuner-rdna2-v620 PROPERTIES
+        PREFIX "lib"
+        OUTPUT_NAME "nccl-tuner-rdna2-v620"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        POSITION_INDEPENDENT_CODE ON
+    )
+    install(TARGETS ggml-rccl-tuner-rdna2-v620
+        LIBRARY DESTINATION lib
+        RUNTIME DESTINATION bin
+    )
 endif()
 
-target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas ${CMAKE_DL_LIBS})

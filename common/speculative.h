@@ -5,6 +5,11 @@
 
 struct common_speculative;
 
+struct common_speculative_token_dist {
+    llama_tokens ids;
+    std::vector<float> probs;
+};
+
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
@@ -37,6 +42,19 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 
 common_params common_base_params_to_speculative(const common_params & params);
 
+// Probe an opt-in sidecar before constructing any host draft model/context.
+// Returns the selected sidecar type and marks params.draft.sidecar_only on
+// success; returns NONE when native draft loading should be retained.
+common_speculative_type common_speculative_sidecar_preflight(
+        common_params_speculative & params, const llama_model * model_tgt,
+        uint32_t n_seq, std::string & error);
+
+// Pre-target check used by model placement and --fit. With SPEC_SIDECAR=1 it
+// also auto-detects a supplied draft GGUF and prepares a missing native cache
+// once, recording the resolved paths in params for post-load preflight.
+bool common_speculative_sidecar_candidate(common_params_speculative & params,
+        const std::string & target_model_path, uint32_t n_seq);
+
 struct common_speculative_output_limits {
     int32_t total;
     int32_t per_seq;
@@ -61,8 +79,12 @@ struct common_speculative_draft_params {
     bool drafting = false;
 
     // overrides individual configurations (-1 disabled)
-    // can be used to constraint the max draft based on the remaining context size
+    // can be used to constrain the max draft based on the remaining context size
     int32_t n_max = -1;
+
+    // Set by the server only when the request supplied speculative.n_max.
+    // This is internal metadata; it does not add a command-line/API setting.
+    bool n_max_user_override = false;
 
     llama_pos   pos0;
     llama_token id_last;
@@ -79,6 +101,16 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+    // optional sparse proposal distributions, one per draft token
+    std::vector<common_speculative_token_dist> * dists = nullptr;
+
+    float temperature = 0.0f;
+
+    // Internal sidecar-only content-aware stacked-verification controls.
+    // n_max remains the request/capacity envelope; n_max_ngram may narrow the
+    // K4V proposal within that envelope and never widens neural generation.
+    int32_t n_max_ngram = -1;
+
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -92,15 +124,40 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
-// informs the speculative context that n_accepted tokens were accepted by the target model
+// Informs the speculative context that verified tokens were accepted by the
+// target model. The four-argument form separates committed replay context from
+// the true accepted-draft count used by telemetry.
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+void common_speculative_accept(common_speculative * spec, llama_seq_id,
+                               uint16_t n_accepted, uint16_t n_accepted_draft);
 
-// (optional) get/set internal state
+// (optional) checkpoint and lifecycle state. State is keyed by implementation;
+// sidecars store only a small cursor/epoch while keeping device KV resident.
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+void common_speculative_reset_state(common_speculative * spec, llama_seq_id seq_id);
+// Release per-request state while allowing implementations to retain state tied
+// to a resident target prompt. Before reusing that prompt, prepare validates the
+// implementation cursor; false means the caller must replay from position zero.
+void common_speculative_release_state(common_speculative * spec, llama_seq_id seq_id);
+bool common_speculative_prepare_prompt_state(
+        common_speculative * spec, llama_seq_id seq_id, llama_pos pos_next, bool can_reuse_resident);
+// Discard a state suffix without committing new target rows.
+bool common_speculative_truncate_state(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_max);
+// Commit target rows that are known to be accepted (prompt/ordinary decode or
+// the accepted prefix of speculative verification).
+bool common_speculative_commit_state(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_max);
+bool common_speculative_rebase_state(common_speculative * spec, llama_seq_id seq_id,
+        llama_pos pos_min, llama_pos pos_max, llama_pos delta);
+// Attention-window KV snapshot for host prompt-cache entries. A negative size
+// means the active implementation has no portable snapshot; set returns false
+// when data is non-empty and no implementation can apply it.
+int32_t common_speculative_kv_state_size(common_speculative * spec, llama_seq_id seq_id);
+bool common_speculative_get_kv_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
+bool common_speculative_set_kv_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 // print statistics about the speculative decoding
-void common_speculative_print_stats(const common_speculative * spec);
+void common_speculative_print_stats(const common_speculative * spec, llama_seq_id seq_id = -1);
 
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
@@ -114,6 +171,8 @@ struct common_speculative_init_result {
 
     llama_model   * model();
     llama_context * context();
+    bool sidecar_only() const;
+    common_speculative_type sidecar_type() const;
 
 private:
     struct impl;

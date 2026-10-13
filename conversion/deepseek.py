@@ -927,6 +927,10 @@ class DeepseekV4Model(TextModel):
 @ModelBase.register("DeepseekV4DSparkModel")
 @ModelBase.example("deepseek-ai/DeepSeek-V4-Flash-DSpark")
 class DeepseekV4DSparkModel(DeepseekV4Model):
+    # DSpark draft with a DeepSeek-V4 backbone (MLA + MoE + hyper-connections). The checkpoint
+    # ships "mtp.{0,1,2}.*" tensors only (no embed/head, shared with the target at runtime) under
+    # the same "DeepseekV4ForCausalLM" architecture string as the target; get_model_architecture()
+    # routes here via the flat "dspark_*" hparams instead.
     model_arch = gguf.MODEL_ARCH.DFLASH
 
     _DSPARK_ROOT_MAP: dict[str, tuple[gguf.MODEL_TENSOR, str]] = {
@@ -940,18 +944,39 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        # The target's num_hidden_layers has nothing to do with the drafter: the block count is
+        # the number of MTP stages actually present in the shards (3 for this checkpoint).
         self.block_count = 1 + max(
             int(match.group(1)) for name in self.model_tensors
             if (match := re.match(r"layers\.(\d+)\.", name))
         )
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
+        # MTP blocks force compress_ratio=0 (plain sliding-window attention, no lightning
+        # indexer) and never use hash-routed layers; patch the shared target hparams here since
+        # generate_extra_tensors() (which reads num_hash_layers) runs before set_gguf_parameters.
         self.hparams["compress_ratios"] = [0] * self.block_count
         self.hparams["num_hash_layers"] = 0
 
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        # Local DSpark checkpoints only ship the MTP shards; the target index may list the full
+        # backbone, so enumerate the shards that are actually present instead of trusting it.
         if remote_hf_model_id is None:
-            return super().index_tensors()
+            tensors: dict[str, Callable[[], Tensor]] = {}
+            for part_name in ModelBase.get_model_part_names(self.dir_model, "model", ".safetensors"):
+                logger.info(f"gguf: indexing model part '{part_name}'")
+                with gguf.utility.SafetensorsLocal(self.dir_model / part_name) as model_part:
+                    for name in model_part.keys():
+                        data: gguf.utility.LocalTensor = model_part[name]
+                        if self.lazy:
+                            data_gen = lambda data=data: LazyTorchTensor.from_local_tensor(data)  # noqa: E731
+                        else:
+                            dtype = LazyTorchTensor._dtype_str_map[data.dtype]
+                            data_gen = lambda data=data, dtype=dtype: torch.from_numpy(data.mmap_bytes()).view(dtype).reshape(data.shape)  # noqa: E731
+                        if titem := self.filter_tensors((name, data_gen)):
+                            tensor_name, tensor_gen = titem
+                            tensors[tensor_name] = tensor_gen
+            return tensors
 
         with open(self.dir_model / "model.safetensors.index.json", "r", encoding="utf-8") as f:
             weight_map = json.load(f)["weight_map"]
@@ -980,6 +1005,8 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
+        # Only "mtp.*" tensors are shipped in these shards; the index also lists absent target
+        # backbone tensors, so silently drop anything that is not a draft tensor.
         if not name.startswith("mtp."):
             return None
         return super().filter_tensors((cls._rekey_mtp_tensor_name(name), gen))
@@ -1016,8 +1043,11 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
 
     def set_vocab(self):
         if self.target_model_dir is None:
-            raise ValueError("DeepSeek-V4 DSpark requires --target-model-dir with the target tokenizer")
-
+            raise ValueError(
+                "DSpark draft model requires --target-model-dir to be specified. "
+                "Please provide the path to the target model directory containing the tokenizer."
+            )
+        logger.info(f"DSpark: Using tokenizer from target model: {self.target_model_dir}")
         original_dir = self.dir_model
         try:
             self.dir_model = self.target_model_dir
