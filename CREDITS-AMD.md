@@ -1,0 +1,16 @@
+# AMD source credits
+
+This fork builds on ggml-org/llama.cpp and its contributors. Source authorship is preserved in the cherry-picked commits, along with the original revision references. Upstream history and licenses remain intact.
+
+| Author and source | Original commit | Included change |
+| --- | --- | --- |
+| mxxm-t, [mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) | [f6da2e696](https://github.com/mxxm-t/mx-llama.cpp/commit/f6da2e69660fe787e61ce5021162e58fd538b2ab) | Compile normalization channel/sample loops only for grids that exceed the launch limits. |
+| Laurent Zuijdwijk, [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) | [db73f798f](https://github.com/halo-box/strix-llama.cpp/commit/db73f798f2e5b3ee2e1eba26e2eac79a246e8551) | Keep small UMA readbacks direct while retaining the staged path for large uncached reads. |
+| Edwin Brown, [llama.cpp-rdna2](https://github.com/edwinbrowwn/llama.cpp-rdna2) | [d5295d36d](https://github.com/edwinbrowwn/llama.cpp-rdna2/commit/d5295d36d9b750d8b11a735c68b6c68a43c2c399) | Widen RDNA3.0 MXFP4 matrix-vector dot processing. |
+| Edwin Brown, [llama.cpp-rdna2](https://github.com/edwinbrowwn/llama.cpp-rdna2) | [f35976c38](https://github.com/edwinbrowwn/llama.cpp-rdna2/commit/f35976c38cb25e580b02572455dd875db1bde16f) | Widen RDNA3.0 Q8_0 matrix-vector dot processing. |
+
+The normalization cherry-pick was adapted to retain upstream's newer vectorized RMSNorm dispatcher. The Q8_0 kernel was retained without importing its source fork's launcher documentation; the relevant measurements are linked in the audit.
+
+The default branch also inherits upstream work for gfx900, RDNA3.5 MMQ, and BF16 fallback on devices without native BF16 acceleration. These are not represented as new work by this fork.
+
+The previous combined AMD import was reverted in `9b229d705`. Its source references remain in Git history; the milpster Vega table and the Strix-Halo transpose/concat import are no longer in the current tree. Credits for the separate V620 model integration remain on `v620-dev`.
