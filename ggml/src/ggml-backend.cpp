@@ -1031,6 +1031,8 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool moe_prefill;
+    unsigned off_rr;
 
     int debug;
 
@@ -1201,11 +1203,34 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    // Keep each layer's routed expert operations together across prefill devices.
+                    int eligible[GGML_SCHED_MAX_BACKENDS];
+                    int n_eligible = 0;
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
-                            SET_CAUSE(tensor, "1.off");
-                            return b;
+                            eligible[n_eligible++] = b;
                         }
+                    }
+                    if (n_eligible > 0) {
+                        unsigned key = 0;
+                        if (sched->moe_prefill && tensor->op == GGML_OP_MUL_MAT_ID && i == 0 && tensor->src[2]->ne[1] >= 32) {
+                            // Parse modulo the eligible count so long names cannot overflow.
+                            const char * p = src->name;
+                            bool has_layer = strncmp(p, "blk.", 4) == 0;
+                            if (has_layer) {
+                                p += 4;
+                                has_layer = *p >= '0' && *p <= '9';
+                                while (*p >= '0' && *p <= '9') {
+                                    key = (key*10 + (unsigned) (*p++ - '0')) % (unsigned) n_eligible;
+                                }
+                                has_layer = has_layer && *p == '.';
+                            }
+                            if (!has_layer) {
+                                key = sched->off_rr++ % (unsigned) n_eligible;
+                            }
+                        }
+                        SET_CAUSE(tensor, "1.off");
+                        return eligible[key];
                     }
                 }
                 SET_CAUSE(tensor, "1.wgt%d", i);
@@ -1297,6 +1322,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    sched->off_rr = 0;
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -2229,6 +2255,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    const char * moe_prefill = getenv("GGML_MOE_PREFILL");
+    sched->moe_prefill = moe_prefill == nullptr || strcmp(moe_prefill, "0") != 0;
 
     ggml_backend_sched_reset(sched);
 
