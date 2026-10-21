@@ -705,6 +705,18 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 
+// MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep
+// plus control and user-defined tokens. Immutable once built. Contexts that request the same n_keep share one.
+struct llama_mtp_draft_vocab {
+    int32_t n_keep = 0;
+
+    ggml_tensor * head = nullptr; // [n_embd, n_rows], same type as the LM head
+    ggml_tensor * ids  = nullptr; // [n_rows] I64, token id of each row
+
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -891,6 +903,10 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
+    // draft vocabulary subset for mtp_draft_vocab = n_keep, built on first request and freed with the last context
+    // holding it; nullptr if the subset cannot be used with this model (thread-safe)
+    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep) const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 
@@ -909,6 +925,11 @@ struct llama_model {
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+
+    // work a model runs beside one llama_context::decode of the whole batch; `state` belongs to the calling context and
+    // prefetch_end runs on every exit of that decode. Nothing by default
+    virtual void prefetch_begin(std::unique_ptr<llama_model_prefetch> & /*state*/, const llama_batch & /*batch*/, uint32_t /*n_ubatch*/) const {}
+    virtual void prefetch_end(llama_model_prefetch * /*state*/) const {}
 
 protected:
     llama_model_params params;

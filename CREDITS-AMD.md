@@ -14,3 +14,7 @@ The normalization cherry-pick was adapted to retain upstream's newer vectorized 
 The default branch also inherits upstream work for gfx900, RDNA3.5 MMQ, and BF16 fallback on devices without native BF16 acceleration. These are not represented as new work by this fork.
 
 The previous combined AMD import was reverted in `9b229d705`. Its source references remain in Git history; the milpster Vega table and the Strix-Halo transpose/concat import are no longer in the current tree. Credits for the separate V620 model integration remain on `v620-dev`.
+
+## Halo development source
+
+`halo-dev` integrates [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) at `da731374077f2ad9bdffd4848f782b5694b9bb68` with its original commit history and authorship. See [integration notes](docs/halo-dev-integration.md) for local adaptations and validation limits.

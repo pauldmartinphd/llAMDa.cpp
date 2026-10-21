@@ -1309,8 +1309,11 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
+    // keep indexer keys f16 regardless of type_k: the fused indexer kernels read
+    // f16 only, and quantizing this small cache (128 dims) saves little while
+    // forcing the much slower decomposed indexer path
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, hparams_lid, type_k, type_v,
+            model, hparams_lid, GGML_TYPE_F16, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
@@ -1916,6 +1919,7 @@ ggml_tensor * llama_kv_cache_dsv4_raw_context::build_input_k_idxs(ggml_context *
 
     ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
     ggml_set_input(k_idxs);
+    ggml_set_name(k_idxs, "dsv4_raw_attn_inp_k_idxs");
 
     return k_idxs;
 }

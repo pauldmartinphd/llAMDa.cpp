@@ -429,6 +429,17 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+#ifndef GGML_USE_TRELLIS
+    // built with GGML_TRELLIS=OFF: the trellis types have no CPU kernels (vec_dot / from_float) in this build
+    for (int i = -1; i < GGML_MAX_SRC; i++) {
+        const struct ggml_tensor * t = i < 0 ? op : op->src[i];
+        if (t && (t->type == GGML_TYPE_PTQ1_0 || t->type == GGML_TYPE_TQ2_T || t->type == GGML_TYPE_TQK6 || t->type == GGML_TYPE_TQK7 ||
+                  t->type == GGML_TYPE_TQP5 || t->type == GGML_TYPE_TQP6 || t->type == GGML_TYPE_TQP7)) {
+            return false;
+        }
+    }
+#endif
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
@@ -455,10 +466,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
             }
-            // BF16 in src1 is widened into the F32 work buffer
+            // BF16 in src1 is widened into the F32 work buffer; an F16 src1 is converted to the vec_dot type through F32
+            // (the f16 activations of a Vulkan-first graph)
             return src1->type == GGML_TYPE_F32 ||
                    src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
-                   (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
+                   (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32) ||
+                   (src1->type == GGML_TYPE_F16 && ggml_get_type_traits_cpu(ggml_get_type_traits_cpu(src0->type)->vec_dot_type)->from_float != nullptr);
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

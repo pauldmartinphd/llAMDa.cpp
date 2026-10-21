@@ -116,6 +116,7 @@ struct llama_context {
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+    void set_eval_callback(ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data);
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
@@ -306,8 +307,14 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
+    // MTP draft vocabulary subset used by this context's graphs (nullptr = full vocabulary)
+    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft;
+
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // llama_model::prefetch_begin state of this context's decodes
+    std::unique_ptr<llama_model_prefetch> prefetch;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

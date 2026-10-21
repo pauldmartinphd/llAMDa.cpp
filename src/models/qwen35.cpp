@@ -231,6 +231,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);
+    if (cparams.embeddings_nextn && n_tokens <= 16 && cur->op == GGML_OP_MUL_MAT) {
+        ggml_mul_mat_set_hint(cur, GGML_HINT_EXACT_BATCH);
+    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
@@ -280,6 +283,16 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
             n_embd_head,     n_head_kv,
             n_embd_head,     n_head_kv,
             il, false);
+    if (cparams.embeddings_nextn && n_tokens <= 16) {
+        for (ggml_tensor * projection : { Qcur_full, Kcur, Vcur }) {
+            while (projection->view_src != nullptr || projection->op == GGML_OP_CONT) {
+                projection = projection->src[0];
+            }
+            if (projection->op == GGML_OP_MUL_MAT) {
+                ggml_mul_mat_set_hint(projection, GGML_HINT_EXACT_BATCH);
+            }
+        }
+    }
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
@@ -396,7 +409,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, nullptr, /*allow_inplace=*/true);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -656,7 +669,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (mtp_draft != nullptr && head_w == model.output && n_outputs == 1) {
+        // this context drafts over a row subset of the LM head: scatter its logits into a full-vocab row of -inf
+        GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
+        const int64_t n_sel = mtp_draft->head->ne[1];
+        const int64_t n_row = model.output->ne[1];
+        ggml_tensor * sub = build_lora_mm(mtp_draft->head, cur, head_s);
+        cur = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_row), -INFINITY);
+        cur = ggml_set_rows(ctx0, cur, ggml_reshape_2d(ctx0, sub, 1, n_sel), mtp_draft->ids);
+        cur = ggml_reshape_2d(ctx0, cur, n_row, 1);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

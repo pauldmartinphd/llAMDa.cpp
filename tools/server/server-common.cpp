@@ -682,7 +682,7 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 }
 
 const llama_tokens & server_tokens::get_tokens() const {
-    GGML_ASSERT(!has_mtmd);
+    GGML_ASSERT(!has_media());
     return tokens;
 }
 
@@ -765,7 +765,7 @@ llama_tokens server_tokens::get_text_tokens() const {
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    GGML_ASSERT(!has_media());
     tokens[pos] = id;
 }
 
@@ -1517,12 +1517,42 @@ json oaicompat_chat_params_parse(
             reasoning_budget = opt.reasoning_budget;
         }
 
+        const bool reasoning_control = json_value(body, "reasoning_control", false);
+        if (body.contains("reasoning_budget_enabled")) {
+            llama_params["reasoning_budget_enabled"] = body.at("reasoning_budget_enabled");
+        }
+
         if (!out_session.thinking_end_tags().empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = out_session.thinking_start_tag();
             llama_params["reasoning_budget_end_tags"] = out_session.thinking_end_tags();
-            llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
-            llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
+            llama_params["reasoning_control"] = reasoning_control;
+
+            const bool has_per_request_reasoning =
+                reasoning_budget >= 0 || reasoning_control || body.contains("reasoning_budget_message") ||
+                body.contains("reasoning_budget_soft_ratio") || body.contains("reasoning_budget_soft_message") ||
+                body.contains("reasoning_budget_soft2_ratio") || body.contains("reasoning_budget_soft2_message") ||
+                body.contains("reasoning_budget_intro_message") || body.contains("reasoning_budget_intro_mode") ||
+                body.contains("reasoning_budget_grace_tokens");
+
+            if (has_per_request_reasoning) {
+                llama_params["reasoning_budget_message"] =
+                    json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
+                llama_params["reasoning_budget_soft_ratio"] =
+                    json_value(body, "reasoning_budget_soft_ratio", opt.reasoning_budget_soft_ratio);
+                llama_params["reasoning_budget_soft_message"] =
+                    json_value(body, "reasoning_budget_soft_message", opt.reasoning_budget_soft_message);
+                llama_params["reasoning_budget_soft2_ratio"] =
+                    json_value(body, "reasoning_budget_soft2_ratio", opt.reasoning_budget_soft2_ratio);
+                llama_params["reasoning_budget_soft2_message"] =
+                    json_value(body, "reasoning_budget_soft2_message", opt.reasoning_budget_soft2_message);
+                llama_params["reasoning_budget_intro_message"] =
+                    json_value(body, "reasoning_budget_intro_message", opt.reasoning_budget_intro_message);
+                llama_params["reasoning_budget_intro_mode"] =
+                    json_value(body, "reasoning_budget_intro_mode", opt.reasoning_budget_intro_mode);
+                llama_params["reasoning_budget_grace_tokens"] =
+                    json_value(body, "reasoning_budget_grace_tokens", opt.reasoning_budget_grace_tokens);
+            }
         }
     }
 

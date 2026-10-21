@@ -51,8 +51,12 @@ enum llm_fused_op {
     LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
+    LLM_FUSED_OP_DSV4_HC_NORM_F16,  // f16 hc norm: HC pre reading an f16 x, hc inject / down matmuls with an f16 B
+    LLM_FUSED_OP_DSV4_HC_GATE_F16,  // f16 hc gate: HC pre reading an f16 gate (the hc up GEMM's f16 store)
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_MOE_F16,           // f16 MoE activations: expert down projection with an f16 B (build_moe_ffn prefill)
+    LLM_FUSED_OP_GDN_NORM_F16,      // f16 GDN output norm: the qwen4exp ssm_out projection with an f16 B (prefill)
 };
 
 enum llm_ffn_op_type : int {
@@ -99,6 +103,12 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+
+// a context's state for llama_model::prefetch_begin / prefetch_end (one per context, made by the model)
+struct llama_model_prefetch {
+    virtual ~llama_model_prefetch() = default;
+};
+struct llama_mtp_draft_vocab;
 
 //
 // llm_graph_input
@@ -298,6 +308,9 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // part of the reuse key: a seq_cp between two ubatches can change it
+    bool s_copy_main_identity = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -812,6 +825,8 @@ struct llm_graph_params {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const llama_mtp_draft_vocab * mtp_draft; // MTP draft vocabulary subset of the context (nullptr = full vocabulary)
+
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
           const std::map<llama_seq_id, llama_sampler *> & rhs) {
@@ -832,6 +847,8 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    llama_model_prefetch * prefetch = nullptr; // the context's llama_model::prefetch_begin state, nullptr = none
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -901,6 +918,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.mtp_draft_vocab         == other.cparams.mtp_draft_vocab         &&
+            mtp_draft == other.mtp_draft &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1006,6 +1025,14 @@ using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 // used in build_rs to properly order writes and avoid unnecessary copies
 using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_tensor * states, ggml_tensor * ids)>;
 
+// how build_rs reads the states of the ubatch: gathered (upstream), or in place on the cache rows when the sequence
+// mapping is the identity, with the same graph nodes for both mappings
+enum llm_rs_inplace {
+    LLM_RS_INPLACE_NONE,
+    LLM_RS_INPLACE_COPY,
+    LLM_RS_INPLACE_IDENTITY,
+};
+
 struct llm_graph_qkv {
     ggml_tensor * q; // [n_embd_head, n_head,    n_tokens]
     ggml_tensor * k; // [n_embd_head, n_head_kv, n_tokens]
@@ -1069,6 +1096,10 @@ struct llm_graph_context {
     const llama_hadamard * hdmd;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const llama_mtp_draft_vocab * mtp_draft; // nullptr = full vocabulary
+
+    llama_model_prefetch * prefetch; // nullptr = none
 
     const llm_graph_cb & cb_func;
 
@@ -1264,7 +1295,9 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * top_k = nullptr,
+                int64_t   n_kv_raw = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1407,16 +1440,20 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr,
+           llm_rs_inplace   inplace_mode = LLM_RS_INPLACE_NONE) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
+    // allow_inplace: when no state is copied, return a view of the cache rows instead of a get_rows copy
+    // the consumer must read the whole state before the write-back cpy
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+            const llm_graph_get_rows_fn & get_state_rows = nullptr,
+                   bool   allow_inplace = false) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

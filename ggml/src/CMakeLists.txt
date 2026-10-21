@@ -201,11 +201,17 @@ add_library(ggml-base
             ggml-alloc.c
             ggml-backend.cpp
             ggml-backend-meta.cpp
+            ggml-backend-sanitize.cpp
+            ggml-backend-sanitize.h
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ../rocmfp4/rocmfp4.c
+            ../rocmfp4/rocmfp4.h
+            ../rocmfpx/rocmfpx.c
+            ../rocmfpx/rocmfpx.h
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES
@@ -222,6 +228,11 @@ endif()
 
 if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
+endif()
+
+# PUBLIC: reaches every backend, llama and the tests through their ggml-base link
+if (GGML_TRELLIS)
+    target_compile_definitions(ggml-base PUBLIC GGML_USE_TRELLIS)
 endif()
 
 if (GGML_OPENMP_FETCH)

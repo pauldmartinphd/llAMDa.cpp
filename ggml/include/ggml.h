@@ -430,7 +430,35 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // ROCmFPx experimental AMD-native formats. These are kept in a high ID
+        // range so upstream type IDs stay free for future ggml types.
+        GGML_TYPE_Q4_0_ROCMFP4      = 100, // ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
+        GGML_TYPE_Q4_0_ROCMFP4_FAST = 101, // ROCmFP4 single-scale speed layout
+        GGML_TYPE_Q6_0_ROCMFPX      = 102, // ROCmFPx experimental 6-bit UE4M3-scale reference layout
+        GGML_TYPE_Q8_0_ROCMFPX      = 103, // ROCmFPx experimental 8-bit UE4M3-scale reference layout
+        GGML_TYPE_Q3_0_ROCMFPX      = 104, // ROCmFPx experimental 3-bit UE4M3-scale reference layout
+        // 105, 106 are TURBO3_0 / TURBO4_0 and 108 is Q4_0_ROCMI4 in charlie12345/ROCmFPX;
+        // left unassigned here so a GGUF from that tree is rejected rather than misread.
+        // Note ciru-ai/ROCmFPX diverges: it puts Q7_0_ROCMFPX at 107 and Q2_0_ROCMFPX at 108.
+        GGML_TYPE_Q2_0_ROCMFPX      = 107, // ROCmFPx experimental 2-bit S40 codebook + dual UE4M3 scales
+        // Prism-private ternary at group size 128, ported from PrismML-Eng/llama.cpp
+        // (Ternary-Bonsai GGUFs). High id so it slots above upstream types; type_traits
+        // is sized to COUNT with 43..99 and 108..142 unused (100..107 are ROCmFPx). PQ2_0 (142) is deliberately not ported:
+        // it has no Vulkan kernels upstream of us either.
+        GGML_TYPE_PTQ1_0  = 143,
+        // Trellis-coded 2.125 bpw (QTIP-style bitshift trellis, L=16 K=8 V=4, hashed
+        // 2-D "Hyb" codebook), group 128.
+        GGML_TYPE_TQ2_T   = 144,
+        // Bit-packed trellis siblings of TQ2_T (K = 6 / 7 new bits per 4-weight step,
+        // same codebook): 1.625 / 1.875 bpw, group 128.
+        GGML_TYPE_TQK6    = 145,
+        GGML_TYPE_TQK7    = 146,
+        // Pair trellis (V=2): 64 steps of 2 weights per 128-weight block, K = 5 / 6 / 7 new bits
+        // per step, TQ2_T codebook (first pair of each state): 2.625 / 3.125 / 3.625 bpw.
+        GGML_TYPE_TQP5    = 147,
+        GGML_TYPE_TQP6    = 148,
+        GGML_TYPE_TQP7    = 149,
+        GGML_TYPE_COUNT   = 150,
     };
 
     // [TAG_GGML_PREC]
@@ -454,6 +482,7 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_EXACT_BATCH      = 2,
     };
 
     // model file types
@@ -486,6 +515,24 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN     = 101, // ROCmFP4 with Q5_K token embeddings
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT = 102, // ROCmFP4 with Q6_K token embeddings
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST     = 103, // ROCmFP4 single-scale speed layout
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT = 104, // ROCmFP4 fast with Q6_K token embeddings
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX    = 105, // ROCmFP4 Strix Halo quality/speed recipe
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN = 106, // ROCmFP4 Strix Halo size-biased K/V recipe
+        GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX          = 110, // ROCmFPx experimental 6-bit reference layout
+        GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX          = 111, // ROCmFPx experimental 8-bit reference layout
+        GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX          = 112, // ROCmFPx experimental 3-bit reference layout
+        GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX          = 113, // ROCmFPx experimental 2-bit S40 codebook layout
+        GGML_FTYPE_MOSTLY_PTQ1_0 = 129, // except 1d tensors (Prism-private group-128 ternary)
+        GGML_FTYPE_MOSTLY_TQ2_T  = 130, // except 1d tensors (trellis-coded, group 128)
+        GGML_FTYPE_MOSTLY_TQK6   = 131, // except 1d tensors (trellis-coded K=6, group 128)
+        GGML_FTYPE_MOSTLY_TQK7   = 132, // except 1d tensors (trellis-coded K=7, group 128)
+        GGML_FTYPE_MOSTLY_TQP5   = 133, // except 1d tensors (pair trellis K=5, group 128)
+        GGML_FTYPE_MOSTLY_TQP6   = 134, // except 1d tensors (pair trellis K=6, group 128)
+        GGML_FTYPE_MOSTLY_TQP7   = 135, // except 1d tensors (pair trellis K=7, group 128)
     };
 
     // available tensor operations:
@@ -2517,6 +2564,16 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // sparse attention hint: attend only to the first n_kv_raw keys (dense prefix) plus the
+    // keys selected by top_k. top_k is I32 [n_top_k, n_tokens, 1, n_streams]; each index i
+    // selects absolute key n_kv_raw + i. Negative or out-of-range indices are ignored.
+    // Backends may ignore the hint: the kq_mask must still encode the same selection, so a
+    // dense fallback computes the identical result.
+    GGML_API void ggml_flash_attn_ext_add_top_k(
+            struct ggml_tensor * a,
+            struct ggml_tensor * top_k,
+                     int64_t     n_kv_raw);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2717,6 +2774,14 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * gate,
             float                 scale);
+
+    // the gated form with an f32 or f16 output (out_type): the mixed stream as an f16 matmul B
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_gated_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            float                 scale,
+            enum ggml_type        out_type);
 
     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
     //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]

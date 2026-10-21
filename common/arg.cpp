@@ -311,6 +311,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    // ROCmFPx types are weight formats here, not KV cache types: flash attention
+    // has no decode path for them (fa_kv_ok in ggml-vulkan.cpp rejects them), and
+    // a quantized V cache force-enables flash attention in llama_init_from_model,
+    // which skips the support probe that would otherwise turn it back off.
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -361,6 +365,7 @@ static bool spec_types_is_default(const common_params & params) {
 common_models_handler common_models_handler_init(const common_params & params, llama_example curr_ex) {
     common_download_hf_plan plan;
     common_download_hf_plan plan_spec;
+    common_download_hf_plan plan_prefill;
     common_download_opts opts;
 
     const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
@@ -416,7 +421,11 @@ common_models_handler common_models_handler_init(const common_params & params, l
         plan_spec = common_download_get_hf_plan(params.speculative.draft.mparams, opts_spec);
     }
 
-    return common_models_handler{plan, plan_spec, opts};
+    if (!params.speculative.prefill.model.hf_repo.empty()) {
+        plan_prefill = common_download_get_hf_plan(params.speculative.prefill.model, opts);
+    }
+
+    return common_models_handler{plan, plan_spec, plan_prefill, opts};
 }
 
 bool common_models_handler_is_preset_repo(const common_models_handler & handler) {
@@ -464,8 +473,9 @@ static std::vector<common_download_task> build_url_tasks(const common_params_mod
 void common_models_handler_apply(common_models_handler & handler, common_params & params, common_download_callback * callback) {
     std::vector<common_download_task> tasks;
 
-    auto & plan      = handler.plan;
-    auto & plan_spec = handler.plan_spec;
+    auto & plan         = handler.plan;
+    auto & plan_spec    = handler.plan_spec;
+    auto & plan_prefill = handler.plan_prefill;
 
     auto opts = handler.opts; // copy
     opts.callback = callback;
@@ -481,6 +491,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     handle_url(params.model);
     handle_url(params.mmproj);
     handle_url(params.speculative.draft.mparams);
+    handle_url(params.speculative.prefill.model);
 
     // optionally, if docker repo is set, resolve it
     if (!params.model.docker_repo.empty()) {
@@ -515,6 +526,13 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         task.opts       = opts;
         tasks.push_back(task);
         had_spec_url = true;
+    }
+    if (!params.speculative.prefill.model.url.empty()) {
+        common_download_task task;
+        task.url        = params.speculative.prefill.model.url;
+        task.local_path = params.speculative.prefill.model.path;
+        task.opts       = opts;
+        tasks.push_back(task);
     }
 
     // handle hf_plan tasks
@@ -627,6 +645,11 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     if (!plan_spec.model_files.empty() && !had_spec_url && !spec_sidecar_found) {
         add_tasks(plan_spec.model_files, plan_spec.primary, params.speculative.draft.mparams);
         had_spec_url = true;
+    }
+
+    // handle plan_prefill (e.g. --spec-prefill-hf)
+    if (!plan_prefill.model_files.empty()) {
+        add_tasks(plan_prefill.model_files, plan_prefill.primary, params.speculative.prefill.model);
     }
 
     if (!plan.model_files.empty()) {
@@ -2714,15 +2737,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
+        "- on-direct: like on, but the arch reads the rows with explicit pread()s instead of demand paging the mmap (currently only PLE tables, page-cached)\n"
         "- auto: on, but only for tensors larger than 4 GiB\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
+            else if (value == "on-direct") { params.lazy_mode = LLAMA_LAZY_MODE_DIRECT; }
             else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
             else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
+    add_opt(common_arg(
+        {"--ple"}, "FNAME",
+        "GGUF with per-layer embedding (PLE) tables to use instead of the tables in the model file; each tensor in it replaces the lookup table of the same name in the model and must have the same shape (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.model.ple = value;
+        }
+    ).set_env("LLAMA_ARG_PLE"));
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
@@ -2760,6 +2792,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
+    add_opt(common_arg(
+        {"--ngram-on-disk"},
+        "deprecated alias for --lazy-mode on",
+        [](common_params & params) {
+            params.lazy_mode = LLAMA_LAZY_MODE_ON;
+        }
+    ).set_env("LLAMA_ARG_NGRAM_ON_DISK"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
@@ -3757,6 +3796,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_EFFORT"));
+    static auto unescape = [](const std::string & s) {
+        std::string r;
+        r.reserve(s.size());
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i] == '\\' && i + 1 < s.size()) {
+                switch (s[i + 1]) {
+                    case 'n':
+                        r += '\n';
+                        i++;
+                        break;
+                    case 't':
+                        r += '\t';
+                        i++;
+                        break;
+                    case 'r':
+                        r += '\r';
+                        i++;
+                        break;
+                    case '\\':
+                        r += '\\';
+                        i++;
+                        break;
+                    case '"':
+                        r += '"';
+                        i++;
+                        break;
+                    default:
+                        r += s[i];
+                        break;
+                }
+            } else {
+                r += s[i];
+            }
+        }
+        return r;
+    };
+
+    add_opt(common_arg({ "--reasoning-budget-enable" }, { "--no-reasoning-budget-enable" },
+                       "enable the reasoning budget mechanism: hard cutoff, soft warning, intro message, grace "
+                       "period, and runtime reasoning control (default: disabled)",
+                       [](common_params & params, bool value) { params.sampling.reasoning_budget_enabled = value; })
+                .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI })
+                .set_env("LLAMA_ARG_THINK_BUDGET_ENABLE"));
+
     add_opt(common_arg(
         {"--reasoning-budget"}, "N",
         "token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)",
@@ -3765,13 +3848,68 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.reasoning_budget_tokens = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
-    add_opt(common_arg(
-        {"--reasoning-budget-message"}, "MESSAGE",
-        "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)",
-        [](common_params & params, const std::string & value) {
-            params.sampling.reasoning_budget_message = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
+    add_opt(common_arg({ "--reasoning-budget-message" }, "MESSAGE",
+                       "message forced when the reasoning budget is exhausted; include the closing tag because it is "
+                       "not appended automatically (default: none)",
+                       [](common_params & params, const std::string & value) {
+                           params.sampling.reasoning_budget_message = unescape(value);
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI })
+                .set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
+    add_opt(common_arg({ "--reasoning-budget-soft-ratio" }, "N",
+                       "fraction of the budget consumed before the first soft warning: <= 0 disables it, "
+                       "(0,1] enables it (default: -1)",
+                       [](common_params & params, const std::string & value) {
+                           params.sampling.reasoning_budget_soft_ratio = std::stof(value);
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI })
+                .set_env("LLAMA_ARG_THINK_BUDGET_SOFT_RATIO"));
+    add_opt(common_arg({ "--reasoning-budget-soft-message" }, "MESSAGE",
+                       "message forced at the first soft reasoning budget threshold (default: none)",
+                       [](common_params & params, const std::string & value) {
+                           params.sampling.reasoning_budget_soft_message = unescape(value);
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI })
+                .set_env("LLAMA_ARG_THINK_BUDGET_SOFT_MESSAGE"));
+    add_opt(common_arg({ "--reasoning-budget-soft2-ratio" }, "N",
+                       "fraction of the budget consumed before the second soft warning: <= 0 disables it, "
+                       "(0,1] enables it (default: -1)",
+                       [](common_params & params, const std::string & value) {
+                           params.sampling.reasoning_budget_soft2_ratio = std::stof(value);
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI })
+                .set_env("LLAMA_ARG_THINK_BUDGET_SOFT2_RATIO"));
+    add_opt(common_arg({ "--reasoning-budget-soft2-message" }, "MESSAGE",
+                       "message forced at the second soft reasoning budget threshold (default: none)",
+                       [](common_params & params, const std::string & value) {
+                           params.sampling.reasoning_budget_soft2_message = unescape(value);
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI })
+                .set_env("LLAMA_ARG_THINK_BUDGET_SOFT2_MESSAGE"));
+    add_opt(common_arg({ "--reasoning-budget-intro-mode" }, "MODE",
+                       "force the intro message for every reasoning block or only once per conversation "
+                       "(default: every)",
+                       [](common_params & params, const std::string & value) {
+                           params.sampling.reasoning_budget_intro_mode = value;
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI })
+                .set_env("LLAMA_ARG_THINK_BUDGET_INTRO_MODE"));
+    add_opt(common_arg({ "--reasoning-budget-intro-message" }, "MESSAGE",
+                       string_format(
+                           "message forced when the reasoning block starts; use {budget} for the configured "
+                           "budget (default: '%s')",
+                           params.sampling.reasoning_budget_intro_message.c_str()),
+                       [](common_params & params, const std::string & value) {
+                           params.sampling.reasoning_budget_intro_message = unescape(value);
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI })
+                .set_env("LLAMA_ARG_THINK_BUDGET_INTRO_MESSAGE"));
+    add_opt(common_arg({ "--reasoning-budget-grace-tokens" }, "N",
+                       "wait up to N tokens for a paragraph break before forcing the exhausted reasoning budget "
+                       "(default: 0, disabled)",
+                       [](common_params & params, int value) { params.sampling.reasoning_budget_grace_tokens = value; })
+                .set_examples({ LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI })
+                .set_env("LLAMA_ARG_THINK_BUDGET_GRACE_TOKENS"));
     add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
@@ -4188,6 +4326,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--spec-draft-adaptive"},
+        string_format("size each draft from measured acceptance rather than always drafting --spec-draft-n-max (default: %s)", params.speculative.draft.adaptive ? "true" : "false"),
+        [](common_params & params) {
+            params.speculative.draft.adaptive = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-draft-max-slots"}, "N",
+        string_format("draft only while at most N slots are generating; with more, the batch of all slots already "
+                      "keeps the GPU busy and verify rows cost more than they save (default: %d, 0 = no limit)",
+                      params.speculative.draft.max_slots),
+        [](common_params & params, int value) {
+            params.speculative.draft.max_slots = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_MAX_SLOTS"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-vocab"}, "N",
+        string_format("MTP: compute draft logits over token ids < N plus control tokens only; verification is unchanged "
+                      "(0 = full vocabulary, default: %d)", params.speculative.draft.mtp_vocab),
+        [](common_params & params, int value) {
+            params.speculative.draft.mtp_vocab = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_VOCAB"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
@@ -4204,6 +4366,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_ubatch = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
+    add_opt(common_arg(
+        {"--spec-n-rs-seq"}, "N",
+        "cap the recurrent-state rollback slots for models that support them (default: -1, follow --spec-draft-n-max).\n"
+        "the recurrent cache holds (1 + N) copies of each sequence's state, so on a large linear-attention\n"
+        "model each slot costs hundreds of MiB. a rollback deeper than N stays correct, it just uses the\n"
+        "slower host checkpoint. 0 disables the fast path entirely",
+        [](common_params & params, int value) {
+            params.speculative.n_rs_seq_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_N_RS_SEQ"));
     add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
@@ -4251,6 +4423,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.p_min = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-pcum"}, "P",
+        string_format("MTP: stop the draft chain before a token whose inclusion drops the product of the drafts' top-1 probabilities below P; the first draft is always kept (0 = off, default: %.2f)", (double)params.speculative.draft.mtp_pcum),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_pcum = std::max(0.0f, std::min(1.0f, std::stof(value)));
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_PCUM"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
@@ -4311,6 +4490,111 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.hf_file = value; // will be used if --spec-draft-hf is set
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_IMATRIX}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+    add_opt(common_arg(
+        {"--spec-prefill", "--speculative-prefill"},
+        "enable speculative prefill using draft model to filter prompt tokens",
+        [](common_params & params) {
+            params.speculative.prefill.enabled = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PREFILL"));
+    add_opt(common_arg(
+        {"--spec-prefill-draft-model", "--spec-prefill-model", "-mpd", "--speculative-prefill-model", "--speculative-prefill-draft-model"}, "FNAME",
+        "draft model for speculative prefill (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.prefill.model.path    = value;
+            params.speculative.prefill.model.hf_file = value; // will be used if --spec-prefill-hf is set
+            params.speculative.prefill.enabled       = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PREFILL_MODEL"));
+    add_opt(common_arg(
+        {"--spec-prefill-draft-hf", "--spec-prefill-hf", "-hfpd", "--speculative-prefill-hf", "--speculative-prefill-draft-hf"}, "<user>/<model>[:quant]",
+        "Hugging Face model repository for speculative prefill draft model (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.prefill.model.hf_repo = value;
+            params.speculative.prefill.enabled       = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PREFILL_HF"));
+    add_opt(common_arg(
+        {"--spec-prefill-draft-ngl", "--spec-prefill-ngl", "-nglpd", "--speculative-prefill-ngl", "--speculative-prefill-draft-ngl"}, "N",
+        string_format("max. number of speculative prefill draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: %s)",
+            params.speculative.prefill.n_gpu_layers == -1 ? "auto" : "all"),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.speculative.prefill.n_gpu_layers = -1;
+            } else if (value == "all") {
+                params.speculative.prefill.n_gpu_layers = -2;
+            } else {
+                params.speculative.prefill.n_gpu_layers = std::stoi(value);
+            }
+            if (!llama_supports_gpu_offload()) {
+                fprintf(stderr, "warning: no usable GPU found, --spec-prefill-ngl option will be ignored\n");
+                fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
+                fprintf(stderr, "warning: consult docs/build.md for compilation instructions\n");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PREFILL_N_GPU_LAYERS"));
+    add_opt(common_arg(
+        {"--spec-prefill-draft-device", "--spec-prefill-device", "-devpd", "--speculative-prefill-device", "--speculative-prefill-draft-device"}, "<dev1,dev2,..>",
+        "comma-separated list of devices to use for offloading the speculative prefill draft model (none = don't offload)\n"
+        "use --list-devices to see a list of available devices",
+        [](common_params & params, const std::string & value) {
+            params.speculative.prefill.devices = parse_device_list(value);
+            params.speculative.prefill.enabled = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PREFILL_DEVICE"));
+    add_opt(common_arg(
+        {"--spec-prefill-draft-ctx", "--spec-prefill-ctx", "--spec-prefill-ctx-size", "--spec-prefill-max-ctx", "-cpd", "--speculative-prefill-ctx", "--speculative-prefill-max-ctx"}, "N",
+        string_format("context size for speculative prefill draft model (default: %d, 0 = draft training limit or main context)", params.speculative.prefill.n_ctx),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("spec-prefill context size must be >= 0");
+            }
+            params.speculative.prefill.n_ctx   = value;
+            params.speculative.prefill.enabled = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PREFILL_CTX_SIZE"));
+    add_opt(common_arg(
+        {"--spec-prefill-p", "--spec-prefill-percentage"}, "P",
+        string_format("fraction of prompt tokens to retain during speculative prefill (default: %.2f)", (double) params.speculative.prefill.percentage),
+        [](common_params & params, const std::string & value) {
+            const float val = std::stof(value);
+            if (val <= 0.0f || val > 1.0f) {
+                throw std::invalid_argument("spec-prefill percentage must be between 0.0 (exclusive) and 1.0 (inclusive)");
+            }
+            params.speculative.prefill.enabled    = true;
+            params.speculative.prefill.percentage = val;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PREFILL_P"));
+    add_opt(common_arg(
+        {"--spec-prefill-chunk", "--spec-prefill-chunk-size"}, "N",
+        string_format("chunk grouping size for speculative prefill (default: %d, 0 to disable)", params.speculative.prefill.chunk_size),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("spec-prefill chunk size must be >= 0");
+            }
+            params.speculative.prefill.chunk_size = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-prefill-lookahead", "--spec-prefill-lah"}, "N",
+        string_format("number of lookahead decode steps on draft model for attention estimation (default: %d)", params.speculative.prefill.look_ahead_cnt),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("spec-prefill lookahead count must be >= 1");
+            }
+            params.speculative.prefill.look_ahead_cnt = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-prefill-pool-kernel"}, "N",
+        string_format("1D average pooling kernel size for attention smoothing (default: %d, 0 to disable)", params.speculative.prefill.pool_kernel_size),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("spec-prefill pool kernel size must be >= 0");
+            }
+            params.speculative.prefill.pool_kernel_size = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
@@ -4824,6 +5108,12 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, hide a cached model from the model list when this preset resolves to the same model file",
         [](common_params &, const std::string &) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_DEDUP_CACHE_MODELS).set_preset_only());
+
+    args.push_back(common_arg(
+        {"hidden"}, "0|1",
+        "in server router mode, omit this model from GET /models (it can still be loaded by name)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_HIDDEN).set_preset_only());
 
     // args.push_back(common_arg(
     //     {"pin"},

@@ -7,6 +7,8 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <mutex>
+#include <vector>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2613,22 +2615,42 @@ struct llama_model_clef : public llama_model_qwen35 {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llama_ple_disk;
 
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
-    class llm_graph_input_kpool;
+    class llm_graph_input_qsa;
+    class llm_graph_input_qsa_k;
 
+    // Set when the n-gram table is left on disk (--lazy-mode on-direct): per_layer_tok_embd is
+    // counted as created but never allocated, mapped or read, and build_ple takes its
+    // rows from this reader instead of ggml_get_rows.
+    std::shared_ptr<llama_ple_disk> ple_disk;
+    // a bf16 matmul weight left after load keeps the hc mixed stream f32; counted once, on the first graph
+    mutable std::once_flag bf16_mm_once;
+    mutable bool           bf16_mm = false;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    bool load_tensors(llama_model_loader & ml) override;
+
+    // bf16 twins of the f32 weights decode reads as mat-vecs, made at load where the values are bf16-exact
+    // (LLAMA_BF16_TWINS=0 disables); bf16_twin() returns nullptr for a weight without one
+    void load_bf16_twins();
+    ggml_tensor * bf16_twin(const ggml_tensor * w) const;
+    std::map<const ggml_tensor *, ggml_tensor *> bf16_twins;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bf16_twin_bufs;
+
+    // the PLE rows of the batch gathered one ubatch ahead on a worker thread (LLAMA_PLE_ASYNC=0: page-cache advice only)
+    void prefetch_begin(std::unique_ptr<llama_model_prefetch> & state, const llama_batch & batch, uint32_t n_ubatch) const override;
+    void prefetch_end(llama_model_prefetch * state) const override;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
-        // the helpers alone, graph_mtp builds its own body
-        struct no_build {};
-        graph(const llama_model & model, const llm_graph_params & params, no_build) :
-            llm_build_delta_net_base(params), model(model) {}
+        // members only, no trunk: graph_mtp builds its own single block
+        graph(const llama_model & model, const llm_graph_params & params, bool mtp);
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
@@ -2646,38 +2668,52 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
+        // q_first > 0 (LLAMA_FN_LAST_ATTN_TRIM, the last layer only): queries, indexer queries, selection and attention for
+        // rows [q_first, n_tokens) only; K/V and the indexer keys of every row are still stored. When the trim is taken,
+        // *tile_out_ids gets the output rows relative to q_first (the returned tensor has n_tokens - q_first rows).
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
-          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+                        int64_t   q_first = 0,
+                    ggml_tensor ** tile_out_ids = nullptr);
 
-        // dense self-attention over the cells the QSA mask keeps
+        // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * sel,
-                        int64_t   n_sel,
+                    ggml_tensor * top_k,
                           float   kq_scale,
                             int   il);
 
-        // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
-        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
+        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
+        // so the layers sharing a ratio share one input set
+        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        llm_graph_input_qsa_k * qsa_k_inp = nullptr;
 
-        // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
-        ggml_tensor * build_qsa_sel(
+        // QSA: store this ubatch's raw indexer keys in the indexer cache (no selection)
+        void build_qsa_store_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
-          llm_graph_input_kpool * inp_kpool,
+                    ggml_tensor * cur,
+                            int   il);
+
+        // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        // q_first > 0: the selection for query rows [q_first, n_tokens) only (q_first a multiple of the score strip),
+        // with q_pos their positions; the indexer keys of every row are stored as before
+        ggml_tensor * build_qsa_top_k(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                        int64_t   q_first = 0,
+                    ggml_tensor * q_pos = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
@@ -2696,6 +2732,12 @@ struct llama_model_qwen4exp : public llama_model_base {
 
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
+
+        // padded f16 destinations (LLAMA_HC_XN_PAD / LLAMA_GDN_NORM_PAD), one per graph: graph leaves are allocated before the
+        // first node, so per-layer buffers would all stay resident (2.8 GB of Flash-Next's 5.3 GB compute buffer at ub 2048)
+        ggml_tensor * hc_xn_pad_buf    = nullptr;
+        ggml_tensor * gdn_norm_pad_buf = nullptr;
+        ggml_tensor * pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name);
 
         // one conv history per cache tensor: delta-net and PLE each have their own
         ggml_tensor * build_conv_state_at(
@@ -2723,7 +2765,6 @@ struct llama_model_qwen4exp : public llama_model_base {
         const llama_model & model;
     };
 
-    // MTP draft head: one QSA block after the trunk, fed by the trunk's hc-wide residual
     struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };

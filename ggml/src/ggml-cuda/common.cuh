@@ -21,6 +21,7 @@
 #endif
 #endif
 #include "ggml-common.h"
+#include "../../rocmfp4/rocmfp4.h"
 
 #include <array>
 #include <algorithm>
@@ -39,6 +40,9 @@
 #else
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
+
+// device-side UE4M3 scale decoder for ROCmFP4 (needs the runtime header above)
+#include "../../rocmfp4/rocmfp4_hip_scale.cuh"
 
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
@@ -115,6 +119,14 @@
 #if !defined(GGML_USE_HIP) && (defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070)
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && (defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070)
+
+// hipCUB (rocPRIM) offers the same device-wide radix sort / scan / reduce entry points as CUB. Using it lifts the
+// ncols <= 1024 limit of ARGSORT / TOP_K on HIP, which otherwise falls back to the CPU (e.g. the QSA indexer top-k
+// of qwen4exp / DeepSeek-V3.2 at contexts beyond 2k tokens).
+#if defined(GGML_USE_HIP) && !defined(GGML_HIP_NO_CUB) && __has_include(<hipcub/hipcub.hpp>)
+#    define GGML_CUDA_USE_CUB
+#    define GGML_CUDA_CUB_IS_HIPCUB
+#endif
 
 // PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
 // However, this has been bugged in CTK < 12.3 for MSVC builds, see
@@ -709,6 +721,24 @@ static __device__ __forceinline__ uint32_t __hgt2_mask(const half2 a, const half
 }
 #endif // (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || (defined(MUSART_VERSION) && MUSART_VERSION < MUSART_HMASK)
 
+// Rounds x to a float in a register before its next use, so the compiler cannot contract it into the following add or multiply.
+static __device__ __forceinline__ float ggml_cuda_materialize(float x) {
+#if defined(GGML_USE_HIP)
+    asm volatile("" : "+v"(x));
+#else
+    volatile float v = x;
+    x = v;
+#endif // defined(GGML_USE_HIP)
+    return x;
+}
+
+// F32 -> BF16, round to nearest even: the rounding of the MMB activation conversion (mmb_cvt_f32_bf16).
+static __device__ __forceinline__ uint16_t ggml_cuda_f32_to_bf16_rne(const float f) {
+    uint32_t u = __float_as_uint(f);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
 #if defined(GGML_USE_HIP)
 #if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)
@@ -1054,6 +1084,20 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4_FAST> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q2_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR2_K;
@@ -1164,6 +1208,63 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qi = QI3_S;
     static constexpr int bs = sizeof(block_iq3_s);
 };
+
+#ifdef GGML_USE_TRELLIS
+// Trellis types (TQ2_T, TQK6, TQK7, TQP5/6/7): 128 weights per block, 32 ints of 4 weights
+// (32 TQ/TQK steps of 4 weights, 64 TQP steps of 2). qi counts those ints (each pairs with one
+// int of q8_1 values); see tq.cuh.
+#define QR_TQ 4
+#define QI_TQ (QK_TQK/QR_TQ)
+static_assert(QK_TQ2_T == QK_TQK, "trellis block sizes differ");
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ2_T> {
+    static constexpr int qk = QK_TQ2_T;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+    static constexpr int bs = sizeof(block_tq2_t);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQK6> {
+    static constexpr int qk = QK_TQK;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+    static constexpr int bs = sizeof(block_tqk6);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQK7> {
+    static constexpr int qk = QK_TQK;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+    static constexpr int bs = sizeof(block_tqk7);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQP5> {
+    static constexpr int qk = QK_TQP;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+    static constexpr int bs = sizeof(block_tqp5);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQP6> {
+    static constexpr int qk = QK_TQP;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+    static constexpr int bs = sizeof(block_tqp6);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQP7> {
+    static constexpr int qk = QK_TQP;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+    static constexpr int bs = sizeof(block_tqp7);
+};
+#endif // GGML_USE_TRELLIS
 
 //////////////////////
 
@@ -1445,6 +1546,8 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_mmb_context;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1456,6 +1559,15 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
+
+    ggml_cuda_mmb_context * mmb = nullptr;
+    bool mmb_opt_in = false; // set by ggml_backend_cuda_set_mmb_enabled, before the first graph
+    bool mmb_small_batch = false; // set by ggml_backend_cuda_set_mmb_small_batch, before the first graph
+    bool mmb_after_compute = true;
+    const void * mmb_first_split = nullptr;
+    std::vector<uint64_t> mmb_graph_sigs;
+    // HC residuals whose remaining readers live in a later split of the same graph on this device: tensor -> uses left
+    std::unordered_map<const ggml_tensor *, int> mmb_res16_pending;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1576,6 +1688,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // RDNA3.5 fused-quantize matvec prologue (y_op == 3), see ggml_cuda_mm_fusion_args_device
+    const ggml_tensor * y_gate = nullptr;
+    const ggml_tensor * y_norm_w = nullptr;
+    float y_eps = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1589,6 +1705,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    // RDNA3.5 fused-quantize matvec prologue (y_op == 3): y' = sigmoid(y_gate) * (rms_norm_128(y) * y_norm_w)
+    const void * y_gate = nullptr;
+    const void * y_norm_w = nullptr;
+    float y_eps = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {

@@ -72,6 +72,10 @@ struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
+    // LLAMA_BF16_TO_F16: bf16 matmul weights loaded as f16 where exact
+    std::set<std::string> f16_from_bf16;
+    size_t f16_from_bf16_rounded = 0;
+    size_t f16_from_bf16_kept    = 0;   // planned as f16 but not exact: loaded as bf16
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
@@ -115,7 +119,13 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
+    // byte ranges of model files that hold tensors replaced by load_ple(), never read
+    std::map<uint32_t, llama_mmap::ranges> ple_replaced;
+    int ple_idx     = -1; // index of the PLE file in files
+    int ple_n_added =  0; // tensors of the PLE file that the model file does not have
+
     llama_files files;
+    std::vector<std::string> fnames; // one per entry of files, for readers that outlive the loader
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -237,6 +247,9 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
+
+    // use the tensors of a PLE GGUF instead of the same-named tensors of the model; call before creating tensors
+    void load_ple(const std::string & fname);
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

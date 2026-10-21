@@ -56,6 +56,8 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+    std::string model_arch; // general.architecture
+    std::string model_desc; // llama_model_desc()
 };
 
 enum server_state {
@@ -161,6 +163,7 @@ struct server_routes {
     server_http_context::handler_t post_systemone;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    server_http_context::handler_t get_dashboard_stats;
 
     // to be used in router mode
     json get_model_info() const;
@@ -194,6 +197,7 @@ private:
     json           cached_models  = nullptr;
     json           cached_props   = nullptr;
     server_metrics cached_metrics;
+    json           cached_dashboard = nullptr;
     // set when a scrape during sleep already reported the throughput buckets
     bool           should_reset_buckets = false;
     // call right before sleep to update the cached responses

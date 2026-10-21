@@ -158,6 +158,31 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_PTQ1_0       = 143, // except 1d tensors (Prism group-128 ternary, 1.75 bpw)
+        LLAMA_FTYPE_MOSTLY_TQ2_T        = 144, // except 1d tensors (trellis-coded, group 128, 2.125 bpw)
+        LLAMA_FTYPE_MOSTLY_TQK6         = 145, // except 1d tensors (trellis-coded K=6, group 128, 1.625 bpw)
+        LLAMA_FTYPE_MOSTLY_TQK7         = 146, // except 1d tensors (trellis-coded K=7, group 128, 1.875 bpw)
+        LLAMA_FTYPE_MOSTLY_TQP5         = 147, // except 1d tensors (pair trellis K=5, group 128, 2.625 bpw)
+        LLAMA_FTYPE_MOSTLY_TQP6         = 148, // except 1d tensors (pair trellis K=6, group 128, 3.125 bpw)
+        LLAMA_FTYPE_MOSTLY_TQP7         = 149, // except 1d tensors (pair trellis K=7, group 128, 3.625 bpw)
+
+        // ROCmFPx experimental AMD-native recipes (high ID range, see ggml_ftype)
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN     = 101, // ROCmFP4 with Q5_K token embeddings
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT = 102, // ROCmFP4 with Q6_K token embeddings
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST     = 103, // ROCmFP4 single-scale speed layout
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT = 104, // ROCmFP4 fast with Q6_K token embeddings
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX    = 105, // ROCmFP4 Strix Halo quality/speed recipe
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN = 106, // ROCmFP4 Strix Halo size-biased K/V recipe
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX          = 110, // ROCmFPx experimental 6-bit reference layout
+        LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX          = 111, // ROCmFPx experimental 8-bit reference layout
+        LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX          = 112, // ROCmFPx experimental 3-bit reference layout
+        LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT    = 113, // ROCmFPx 3-bit agent/tool-call coherent routing
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT    = 114, // ROCmFPx 6-bit agent/tool-call coherent routing
+        LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT    = 115, // ROCmFPx 8-bit agent/tool-call coherent routing
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN     = 116, // ROCmFPx 6-bit size/speed-biased routing
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN = 117, // ROCmFPx 6-bit agent routing without Q8-heavy boosts
+        LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX          = 119, // ROCmFPx 2-bit S40 codebook + dual UE4M3 scales; id as in charlie12345/ROCmFPX (ciru-ai uses 122 and puts Q7_0 here)
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -220,6 +245,7 @@ extern "C" {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+        LLAMA_LAZY_MODE_DIRECT = 3, // like on, but the arch reads the rows with explicit pread()s instead of demand paging the mmap (currently only PLE tables)
     };
 
     enum llama_context_type {
@@ -354,6 +380,9 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // optional GGUF with per-layer embedding (PLE) tables: its tensors replace the lookup tables of the same name in the model
+        const char * path_ple;
     };
 
     struct llama_sampler_seq_config {
@@ -373,6 +402,7 @@ extern "C" {
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
+        int32_t  mtp_draft_vocab;       // MTP contexts only: draft over token ids < N plus control tokens (0 = full vocabulary) [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
@@ -1126,6 +1156,9 @@ extern "C" {
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    // Set evaluation callback
+    LLAMA_API void llama_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data);
 
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results

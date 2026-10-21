@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -17,6 +18,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -153,6 +155,36 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// the f16 hc norm: the fused DSV4_HC_PRE reads an f16 x, and the hc inject / down matmuls take an f16 B.
+// n_tokens_per_seq matches the qwen4exp prefill threshold
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_norm_f16_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_NORM_F16,
+    /*.name             =*/ "fused DeepSeek V4 HC pre (f16 norm)",
+    /*.n_tokens_per_seq =*/ 32,
+};
+
+// the f16 hc gate: the fused DSV4_HC_PRE reads an f16 gate, written by the hc up GEMM's f16 store (MUL_MAT + CPY(f16) fusion:
+// the 84 MB f32 gate tensor of a 2048-token Flash-Next ubatch is neither written nor read back)
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_gate_f16_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_GATE_F16,
+    /*.name             =*/ "fused DeepSeek V4 HC pre (f16 gate)",
+    /*.n_tokens_per_seq =*/ 32,
+};
+// the f16 MoE activations: the expert down projection takes an f16 B. n_tokens_per_seq matches the build_moe_ffn
+// prefill threshold
+static const llm_fused_op_probe llm_fused_op_moe_f16_probe = {
+    /*.op               =*/ LLM_FUSED_OP_MOE_F16,
+    /*.name             =*/ "f16 MoE activations",
+    /*.n_tokens_per_seq =*/ 32,
+};
+
+// the f16 GDN output norm (qwen4exp): the ssm_out projection takes an f16 B. n_tokens_per_seq matches the qwen4exp prefill threshold
+static const llm_fused_op_probe llm_fused_op_gdn_norm_f16_probe = {
+    /*.op               =*/ LLM_FUSED_OP_GDN_NORM_F16,
+    /*.name             =*/ "f16 GDN output norm",
+    /*.n_tokens_per_seq =*/ 32,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COMB,
     /*.name             =*/ "fused DeepSeek V4 HC comb",
@@ -239,7 +271,8 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    // a qwen4exp draft head shipped without its embeddings and LM head borrows them from the target context
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -319,14 +352,49 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
+    // LLAMA_FUSED_GDN_CH=0 selects the ggml-op chunked delta-net formulation for multi-token ubatches
+    if (const char * env = getenv("LLAMA_FUSED_GDN_CH")) {
+        cparams.fused_gdn_ch = atoi(env) != 0;
+    }
 
     cparams.fused_lid = true;
     cparams.auto_flid = false;
 
     cparams.fused_dsv4_hc_pre  = true;
+    cparams.fused_dsv4_hc_norm_f16 = true;
+    cparams.fused_dsv4_hc_gate_f16 = false;   // default off (A/B: +1.4% at depth 0, -3.1% at depth 8k); LLAMA_HC_GATE_F16=1 opts in
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+    // LLAMA_FUSED_DSV4_HC_PRE=0 / LLAMA_FUSED_DSV4_HC_POST=0 keep the unfused hyper-connection graph
+    if (const char * env = getenv("LLAMA_FUSED_DSV4_HC_PRE")) {
+        cparams.fused_dsv4_hc_pre = atoi(env) != 0;
+    }
+    if (const char * env = getenv("LLAMA_FUSED_DSV4_HC_POST")) {
+        cparams.fused_dsv4_hc_post = atoi(env) != 0;
+    }
+    // LLAMA_HC_NORM_F16=0 keeps the qwen4exp hc norm output in f32 at prefill
+    if (const char * env = getenv("LLAMA_HC_NORM_F16")) {
+        cparams.fused_dsv4_hc_norm_f16 = atoi(env) != 0;
+    }
+    // LLAMA_HC_GATE_F16=1 stores the qwen4exp hc mix gate (the hc up GEMM output) as f16 at prefill (default f32)
+    if (const char * env = getenv("LLAMA_HC_GATE_F16")) {
+        cparams.fused_dsv4_hc_gate_f16 = atoi(env) != 0;
+    }
+
+    cparams.fused_moe_f16 = true;
+    cparams.auto_fmoe16   = true;
+    // LLAMA_MOE_F16=0 keeps the MoE expert activations in f32 at prefill
+    if (const char * env = getenv("LLAMA_MOE_F16")) {
+        cparams.fused_moe_f16 = atoi(env) != 0;
+    }
+
+    cparams.fused_gdn_norm_f16 = true;
+    cparams.auto_fgdnn16       = true;
+    // LLAMA_GDN_NORM_F16=0 keeps the qwen4exp GDN output norm in f32 at prefill
+    if (const char * env = getenv("LLAMA_GDN_NORM_F16")) {
+        cparams.fused_gdn_norm_f16 = atoi(env) != 0;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -457,6 +525,21 @@ llama_context::llama_context(
             }
         }
 
+        // the CUDA/HIP BF16 WMMA matmul path (mmb): every arch from 512 rows, for the weight types it takes
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto * set_mmb_fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_enabled") : nullptr;
+            if (set_mmb_fn) {
+                set_mmb_fn(backend.get(), true);
+            }
+            // 32-511-row GEMMs on mmb too: measured on qwen4exp only (see mmb_min_t)
+            auto * set_mmb_small_fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_small_batch") : nullptr;
+            if (set_mmb_small_fn) {
+                set_mmb_small_fn(backend.get(), model.arch == LLM_ARCH_QWEN4EXP);
+            }
+        }
+
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
         // graph outputs buffer
@@ -550,6 +633,14 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+        }
+
+        // the draft vocabulary subset belongs to this context; contexts that ask for the same N share one copy
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.mtp_draft_vocab > 0) {
+            mtp_draft = model.mtp_draft_vocab_get(params.mtp_draft_vocab);
+            if (mtp_draft) {
+                cparams.mtp_draft_vocab = mtp_draft->n_keep;
+            }
         }
 
         sched_reserve();
@@ -666,10 +757,71 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
     if (cparams.auto_fhc) {
         LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
+        // the f16 norm is probed last; the probes before it see the f32 norm graph; the f16 gate after that, on the f16 norm graph
+        bool hc_norm_f16 = cparams.fused_dsv4_hc_norm_f16;
+        bool hc_gate_f16 = cparams.fused_dsv4_hc_gate_f16;
+        cparams.fused_dsv4_hc_norm_f16 = false;
+        cparams.fused_dsv4_hc_gate_f16 = false;
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        // f16 hc norm: fused HC pre path, 32+ tokens per sequence, every layer off the CPU (no CPU path stores it f16); kept
+        // only where the layer's device takes the f16 x in DSV4_HC_PRE and the f16 B in the inject / down matmuls
+        bool hc_pre_f16_devs = true;
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                hc_pre_f16_devs = false;
+                break;
+            }
+        }
+        cparams.fused_dsv4_hc_norm_f16 = hc_norm_f16 && cparams.fused_dsv4_hc_pre && hc_pre_f16_devs &&
+            llm_fused_op_dsv4_hc_norm_f16_probe.n_tokens_per_seq*n_seqs <= cparams.n_ubatch;
+        resolve(llm_fused_op_dsv4_hc_norm_f16_probe, cparams.fused_dsv4_hc_norm_f16);
+        // the f16 gate exists only on the f16 norm graph (the kernel takes it with an f16 x); the probe keeps it only where the
+        // layer's device takes the f16 gate in DSV4_HC_PRE
+        cparams.fused_dsv4_hc_gate_f16 = hc_gate_f16 && cparams.fused_dsv4_hc_norm_f16;
+        resolve(llm_fused_op_dsv4_hc_gate_f16_probe, cparams.fused_dsv4_hc_gate_f16);
         cparams.auto_fhc = false;
+    }
+
+    if (cparams.auto_fmoe16) {
+        // f16 MoE activations: 32+ tokens per sequence, every layer off the CPU, kept only where the expert down projection
+        // takes the f16 B (CUDA/HIP reject a quantized MUL_MAT_ID with an f16 B and keep the f32 graph)
+        bool moe_f16_devs = model.arch == LLM_ARCH_QWEN4EXP || model.arch == LLM_ARCH_QWEN35MOE;   // build_moe_ffn's f16 arch list: no probe reserve or log for others
+        for (uint32_t il = 0; moe_f16_devs && il < model.hparams.n_layer(); ++il) {
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                moe_f16_devs = false;
+                break;
+            }
+        }
+        cparams.fused_moe_f16 = cparams.fused_moe_f16 && moe_f16_devs &&
+            llm_fused_op_moe_f16_probe.n_tokens_per_seq*n_seqs <= cparams.n_ubatch;
+        if (cparams.fused_moe_f16) {
+            LLAMA_LOG_INFO("%s: resolving f16 MoE activations support:\n", func);
+        }
+        resolve(llm_fused_op_moe_f16_probe, cparams.fused_moe_f16);
+        cparams.auto_fmoe16 = false;
+    }
+
+    if (cparams.auto_fgdnn16) {
+        // f16 GDN output norm: 32+ tokens per sequence, every layer off the CPU, kept only where ssm_out takes the f16 B
+        bool gdn_f16_devs = model.arch == LLM_ARCH_QWEN4EXP;   // the only graph that emits it: no probe reserve for others
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                gdn_f16_devs = false;
+                break;
+            }
+        }
+        cparams.fused_gdn_norm_f16 = cparams.fused_gdn_norm_f16 && gdn_f16_devs &&
+            llm_fused_op_gdn_norm_f16_probe.n_tokens_per_seq*n_seqs <= cparams.n_ubatch;
+        if (cparams.fused_gdn_norm_f16) {
+            LLAMA_LOG_INFO("%s: resolving f16 GDN output norm support:\n", func);
+        }
+        resolve(llm_fused_op_gdn_norm_f16_probe, cparams.fused_gdn_norm_f16);
+        cparams.auto_fgdnn16 = false;
     }
 }
 
@@ -1320,6 +1472,17 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     }
 }
 
+void llama_context::set_eval_callback(ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data) {
+    LLAMA_LOG_DEBUG("%s: call\n", __func__);
+
+    cparams.cb_eval           = cb_eval;
+    cparams.cb_eval_user_data = cb_eval_user_data;
+
+    if (sched) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
+    }
+}
+
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1518,29 +1681,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    // LLAMA_GRAPH_TIMING=1: log where the CPU time of a decode goes (build, alloc, inputs)
+    static const bool graph_timing = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")) != 0;
+    int64_t t_build = 0, t_alloc = 0, t_inputs = 0;
+    bool reused = false;
+
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+        reused = true;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
+        ggml_backend_sched_prepare_inputs(sched.get());
 
         n_reused++;
     } else {
+        // The previous asynchronous graph may still use allocations that reset releases.
+        ggml_backend_sched_synchronize(sched.get());
+
         gf_res_prev_active = nullptr;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        const auto t_build_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        t_build = ggml_time_us() - t_build_us;
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1548,23 +1715,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const auto t_alloc_us = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        t_alloc = ggml_time_us() - t_alloc_us;
 
         gf_res_prev_active = res;
     }
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        const auto t_inputs_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        t_inputs = ggml_time_us() - t_inputs_us;
+        if (graph_timing) {
+            LLAMA_LOG_WARN("graph-timing: n_tokens=%3u gtype=%d reused=%d build=%.2f alloc=%.2f inputs=%.2f ms nodes=%d\n",
+                           ubatch.n_tokens, (int) gtype, (int) reused, t_build/1000.0, t_alloc/1000.0, t_inputs/1000.0,
+                           ggml_graph_n_nodes(res->get_gf()));
+        }
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -1818,6 +1992,17 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// ends the model's prefetch on every exit of the decode that began it
+struct llama_prefetch_guard {
+    const llama_model & model;
+    const std::unique_ptr<llama_model_prefetch> & state;
+    ~llama_prefetch_guard() {
+        if (state) {
+            model.prefetch_end(state.get());
+        }
+    }
+};
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1882,6 +2067,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+
+    // the model may start work for the whole batch (qwen4exp gathers its per-layer-embedding rows one ubatch ahead);
+    // the guard ends it with this decode, whatever path leaves it
+    llama_prefetch_guard prefetch_guard { model, prefetch };
+    {
+        // llama_batch_ext keeps tokens as entries; the allocator's flat view has the token IDs
+        const llama_batch & flat = balloc->get_batch();
+        if (flat.token) {
+            model.prefetch_begin(prefetch, flat, cparams.n_ubatch);
+        }
+    }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     if (output_all) {
@@ -2703,9 +2899,11 @@ llm_graph_params llama_context::graph_params(
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
+        /*.mtp_draft   =*/ mtp_draft.get(),
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.prefetch    =*/ prefetch.get(),
     };
 }
 
@@ -2751,6 +2949,7 @@ ggml_status llama_context::graph_compute(
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
+        if (auto * qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) { qsa->qsa_invalidate(); }
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
@@ -3090,7 +3289,7 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            const int64_t n = (winfo.size / ggml_type_size(winfo.tensor->type)) * ggml_blck_size(winfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3221,7 +3420,7 @@ public:
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            const int64_t n = (rinfo.size / ggml_type_size(rinfo.tensor->type)) * ggml_blck_size(rinfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3288,8 +3487,7 @@ public:
 
                 const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
 
-                const size_t   el   = ggml_element_size(src_t);
-                const int64_t n_el = (int64_t) (n_copy / el);
+                const int64_t n_el = (n_copy / ggml_type_size(src_t->type)) * ggml_blck_size(src_t->type);
 
                 auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
                 ggml_backend_view_init(src_v);
@@ -3984,6 +4182,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.mtp_draft_vocab             =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
@@ -4193,6 +4392,14 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
+}
+
+void llama_set_eval_callback(llama_context * ctx, ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data) {
+    if (!ctx) {
+        return;
+    }
+
+    ctx->set_eval_callback(cb_eval, cb_eval_user_data);
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
