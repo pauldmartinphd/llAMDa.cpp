@@ -352,7 +352,7 @@ static ggml_tensor * dsv4_view_1d(ggml_context * ctx, ggml_tensor * t, int64_t n
     return ggml_view_1d(ctx, t, ne0, dsv4_elem_offset(t, i0));
 }
 
-static ggml_tensor * dsv4_view_2d(
+static ggml_tensor * glm5_view_2d(
         ggml_context * ctx,
         ggml_tensor  * t,
         int64_t        ne0,
@@ -472,13 +472,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
     ggml_tensor * base_pre  = dsv4_view_1d(ctx0, hc_base, hc, 0);
     ggml_tensor * base_post = dsv4_view_1d(ctx0, hc_base, hc, hc);
 
-    ggml_tensor * pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
+    ggml_tensor * pre = glm5_view_2d(ctx0, mixes, hc, nt, 0);
     pre = dsv4_hc_affine(ctx0, pre, scale_pre, base_pre);
     pre = ggml_sigmoid(ctx0, pre);
     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
     cb(pre, "hc_pre", il);
 
-    *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
+    *post = glm5_view_2d(ctx0, mixes, hc, nt, hc);
     *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
     *post = ggml_sigmoid(ctx0, *post);
     *post = ggml_scale(ctx0, *post, 2.0f);
@@ -492,7 +492,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
         ggml_tensor * scale_comb = dsv4_view_1d(ctx0, hc_scale, 1, 2);
         ggml_tensor * base_comb  = dsv4_view_1d(ctx0, hc_base, hc*hc, 2*hc);
 
-        *comb = dsv4_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
+        *comb = glm5_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
         *comb = dsv4_hc_affine(ctx0, *comb, scale_comb, base_comb);
         *comb = ggml_reshape_3d(ctx0, *comb, hc, hc, nt);
         *comb = build_hc_sinkhorn(*comb, il);

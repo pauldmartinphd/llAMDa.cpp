@@ -143,7 +143,7 @@ int main(int argc, char ** argv) {
         }
         // Prompt rows are unconditionally accepted. Sidecars stage target KV
         // until this explicit commit so their first draft starts at n_past.
-        if (!common_speculative_commit_state(spec, seq_id, (llama_pos) batch_prompt.n_tokens)) {
+        if (!common_speculative_commit_state(spec, seq_id, (llama_pos) batch_prompt.size())) {
             LOG_ERR("%s", "failed to commit speculative prompt state\n");
             return 1;
         }
@@ -197,18 +197,17 @@ int main(int argc, char ** argv) {
             n_draft_max = std::max(n_draft_max, 0);
 
             // generate a new draft
-            common_speculative_get_draft_params(spec, seq_id) = {
-                /* .drafting   = */ true,
-                /* .n_max      = */ n_draft_max,
-                /* .n_max_user_override = */ false,
-                /* .pos0     = */ n_past,
-                /* .id_last    = */ id_last,
-                /* .prompt     = */ &prompt_tgt,
-                /* .result     = */ &draft, // output
-                /* .dists      = */ &dists,
-                /* .temperature = */ params.sampling.temp,
-                /* .seed       = */ common_sampler_get_seed(smpl.get()),
-            };
+            auto & draft_params = common_speculative_get_draft_params(spec, seq_id);
+            draft_params = {};
+            draft_params.drafting   = true;
+            draft_params.n_max      = n_draft_max;
+            draft_params.pos0       = n_past;
+            draft_params.id_last    = id_last;
+            draft_params.prompt     = &prompt_tgt;
+            draft_params.result     = &draft;
+            draft_params.dists      = &dists;
+            draft_params.temperature = params.sampling.temp;
+            draft_params.seed       = common_sampler_get_seed(smpl.get());
             common_speculative_draft(spec);
 
             // save a checkpoint of the target context before evaluating the draft
@@ -255,7 +254,7 @@ int main(int argc, char ** argv) {
             break;
         }
         if (draft.empty() && !common_speculative_commit_state(
-                    spec, seq_id, batch_tgt.pos[batch_tgt.n_tokens - 1] + 1)) {
+                    spec, seq_id, batch_tgt.tokens.back().pos[0] + 1)) {
             LOG_ERR("%s", "failed to commit non-speculative target state\n");
             break;
         }
