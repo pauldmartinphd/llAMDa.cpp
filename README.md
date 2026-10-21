@@ -1,10 +1,12 @@
 # llama.cpp: Vega development
 
-I keep the shared AMD changes in [`amd-main`](https://github.com/pauldmartinphd/llama.cpp/tree/amd-main). This branch carries the remaining work from [mxxm-t/mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) for Vega development, including gfx906 weight repacking, multi-stage tensor parallelism, and speculative decoding work. It includes experimental and opt-in features that have not been promoted to the common branch.
+DeepSeek-V4.1 and DSpark now use the shared Daniel Han / Unsloth implementation from `amd-main`. The older V4.1 port is superseded. [Matching models, instructions and known issues](docs/deepseek41.md).
+
+I keep the shared AMD changes in [`amd-main`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/amd-main). This branch carries the remaining work from [mxxm-t/mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) for Vega development, including gfx906 weight repacking, multi-stage tensor parallelism, and speculative decoding work. It includes experimental and opt-in features that have not been promoted to the common branch.
 
 The source history and authorship are preserved. Integration details, source revision and validation limits are in [the integration notes](docs/vega-dev-integration.md). Shared patch credits are in [CREDITS-AMD.md](CREDITS-AMD.md).
 
-The development branches are [`rdna-dev`](https://github.com/pauldmartinphd/llama.cpp/tree/rdna-dev), [`halo-dev`](https://github.com/pauldmartinphd/llama.cpp/tree/halo-dev), and [`vega-dev`](https://github.com/pauldmartinphd/llama.cpp/tree/vega-dev).
+The development branches are [`rdna-dev`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/rdna-dev), [`halo-dev`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/halo-dev), and [`vega-dev`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/vega-dev).
 
 ## Source fork documentation
 
