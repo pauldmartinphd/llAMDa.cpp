@@ -1,5 +1,7 @@
 # llama.cpp: RDNA development
 
+The shared [MoE prefill patch](docs/moe-prefill-offload.md) distributes eligible expert work by layer, with round-robin fallback, and bypasses routing readback at high selection density. Both parts are enabled by default; set `GGML_MOE_PREFILL=0` for an A/B comparison.
+
 DeepSeek-V4.1 and DSpark now use the shared Daniel Han / Unsloth implementation from `amd-main`. The older V4.1 port is superseded. [Matching models, instructions and known issues](docs/deepseek41.md).
 
 `rdna-dev` is the RDNA2/RDNA3 development branch of my AMD llama.cpp fork. It carries the former `v620-dev` integration, rebased onto `amd-main`, including the V620 kernels, DeepSeek-V4.1/DSpark support, expert-cache experiments, and model-specific sidecars. The broader development features retain their own build and runtime requirements.
