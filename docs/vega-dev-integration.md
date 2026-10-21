@@ -13,3 +13,7 @@ The common normalization fix removes a stale launch-wrapper fragment left by an 
 ## Validation
 
 The full CPU build passed on macOS with Metal disabled. Targeted CPU tests cover chat, sampling, GGUF, quantization, allocation and related changed components. These checks do not compile HIP or Vulkan, validate GPU kernels, or establish inference correctness or performance on AMD hardware. Hardware validation remains required before promoting further changes to `amd-main`.
+
+## Repository automation
+
+GitHub Actions workflows remain identical to amd-main. Source-fork CI deployment and hardware-runner configuration are not adopted by this integration. The source commits remain in history; their workflow changes are explicitly reverted at the branch tip.

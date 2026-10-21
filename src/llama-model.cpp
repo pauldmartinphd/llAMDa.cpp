@@ -454,10 +454,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
-    // V4.1 shares V4's grouped attention output, so every rule that sizes a per-head or per-group segment by dsv4_o_group_count applies to it as well.
-    // Left out, the attention sinks fell to the generic per-head granularity, which put all 64 of a layer's sink values on one lane while the attention node held 32 heads per lane.
-    const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
-        ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
+    const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
@@ -2877,15 +2874,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     // once it lives on the devices.
     const buft_list_t * buft_list_input = pimpl->dev_input.buft_list;
 
-    // Same reasoning as the PLE table below, and the stakes are higher: the two DeepSeek-V4.1 engram tables are 48.6 GiB each, the default meta rule for an unrecognised tensor is MIRRORED, and a GET_ROWS support check that accepts them into VRAM would put a copy of each on every device.
-    // Pin them to plain CPU and let the rows page in as they are gathered.
-    if (tn.tensor == LLM_TENSOR_ENGRAM_EMBED) {
-        static const buft_list_t engram_cpu_only = {
-            { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU),
-              ggml_backend_cpu_buffer_type() }
-        };
-        buft_list_input = &engram_cpu_only;
-    }
+
 
     if (tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) {
         if (llama_ple_shard_enabled() && params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
@@ -3545,6 +3534,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr);
                 }
             } break;
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
             {
@@ -3978,7 +3968,7 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here
-    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) {
         return 0;
     }
     return model->hparams.n_swa;

@@ -548,10 +548,6 @@ struct llama_layer {
 
     // DeepSeek-V4
     struct ggml_tensor * attn_kv_norm = nullptr;
-    struct ggml_tensor * engram_embed = nullptr;
-    struct ggml_tensor * engram_wkv   = nullptr;
-    struct ggml_tensor * engram_q     = nullptr;
-    struct ggml_tensor * engram_k     = nullptr;
 
     struct ggml_tensor * hc_attn_fn   = nullptr;
     struct ggml_tensor * hc_attn_base = nullptr;
@@ -611,6 +607,10 @@ struct llama_layer {
     // glm5-next k-pool indexer
     struct ggml_tensor * indexer_kpool_gate = nullptr;
     struct ggml_tensor * indexer_kpool_ape  = nullptr;
+
+    // deepseek41
+    struct ggml_tensor * engram_kv   = nullptr;
+    struct ggml_tensor * engram_gate = nullptr; // q_weight*k_weight folded
 
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;
