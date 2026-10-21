@@ -1,4 +1,4 @@
-# llama.cpp for AMD
+# llAMDa.cpp
 
 I maintain this fork to bring useful AMD performance work into one place without requiring a collection of custom launchers. The hardware I care about includes older Vega cards, RDNA2 cards such as the Radeon Pro V620, and Strix Halo. These systems have different execution and memory constraints, so a change that helps one of them needs an appropriate device or workload condition before it becomes a default for the others.
 
@@ -8,13 +8,13 @@ The default branch, **`amd-main`**, follows upstream llama.cpp with selected com
 
 | Branch | Purpose |
 | --- | --- |
-| **`amd-main`** | Upstream-based AMD integration and the default branch. Current additions cover normalization dispatch, Vulkan UMA readback, and RDNA3 Q8_0/MXFP4 decode. |
-| `rdna-dev` | The broader V620 development branch, including the DeepSeek-V4.1/DSpark integration, cache experiments, and sidecar work. |
+| **`amd-main`** | Upstream-based AMD integration and the default branch. Current additions cover normalization dispatch, Vulkan UMA readback, RDNA3 Q8_0/MXFP4 decode, and Unsloth DeepSeek-V4.1/DSpark support. |
+| `rdna-dev` | The broader V620 development branch, including cache experiments, architecture-specific kernels, and sidecar work. |
 | `halo-dev` | Strix Halo development work from halo-box/strix-llama.cpp, integrated onto the common AMD base. |
 | `vega-dev` | Vega development work from mxxm-t/mx-llama.cpp, integrated onto the common AMD base. |
 | `master` | The upstream tracking branch. |
 
-Model support on `amd-main` follows its upstream base. Use `rdna-dev` for the additional DeepSeek-V4.1/DSpark work until that integration has been brought forward separately.
+`amd-main` includes Unsloth's DeepSeek-V4.1-Flash-1017 and DSpark implementation. It replaces the older V4.1 port. See [model downloads, build instructions and known issues](docs/deepseek41.md).
 
 The current patch selection has source-reported AMD measurements, but this branch has not yet been built or benchmarked on AMD hardware locally. CPU build and regression results establish that the surrounding code still works; they do not establish HIP kernel correctness or a model throughput gain. I record that distinction in the [patch audit and validation notes](docs/amd-main.md).
 
