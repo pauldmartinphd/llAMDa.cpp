@@ -1232,15 +1232,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             op = info.op;
         }
 
-        if (get_arch() == LLM_ARCH_DEEPSEEK41 && t_meta->type == GGML_TYPE_BF16 &&
-                (tn_tensor == LLM_TENSOR_ENGRAM_Q || tn_tensor == LLM_TENSOR_ENGRAM_K) &&
-                tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {
-            const char * cast_device = getenv("LLAMA_DSV41_ENGRAM_CAST_DEVICE");
-            if (cast_device != nullptr && atoi(cast_device) != 0) {
-                op = GGML_OP_CPY;
-                LLAMA_LOG_WARN("%s: experimental Engram F32 cast placement probe for %s\n", __func__, tn.str().c_str());
-            }
-        }
+
 
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
