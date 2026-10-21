@@ -459,6 +459,7 @@ extern "C" {
         GGML_TYPE_TQP6    = 148,
         GGML_TYPE_TQP7    = 149,
         GGML_TYPE_COUNT   = 150,
+        GGML_TYPE_MXFP8   = 43, // MXFP8 (E4M3, E8M0 scale), gather-only
     };
 
     // [TAG_GGML_PREC]
