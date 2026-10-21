@@ -154,7 +154,7 @@ SPEC_SIDECAR=1 ./build/bin/llama-server \
   -m /models/Qwen3.8-Flash-Next-00001-of-00004.gguf \
   -md /models/Qwen3.8-Flash-Next-MTP-Q4_0.gguf \
   --spec-type draft-mtp,ngram-map-k4v --spec-draft-n-max 3 \
-  --batch-size 128 --ubatch-size 128 --spec-draft-ubatch-size 128 \
+  --batch-size 128 --ubatch-size 128 --spec-draft-n-ubatch 128 \
   --parallel 1 --ctx-checkpoints 0
 ```
 

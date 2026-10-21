@@ -1,6 +1,6 @@
 # Multi-GPU MoE prefill offload
 
-Adapted from Paul Martin's [prefill notebook patch](https://github.com/pauldmartinphd/llm-performance-engineering-notebook/blob/main/patches/prefill/README.md). His July GLM-5.2 experiment measured 13.7% better pp8192 throughput from distribution plus routing-readback bypass; distribution alone did not improve throughput. Those results do not establish performance for this port or other models. Codex adapted and locally tested this port.
+Adapted from Paul Martin's [prefill notebook patch](https://github.com/pauldmartinphd/llm-performance-engineering-notebook/blob/main/patches/prefill/README.md). His July GLM-5.2 experiment measured 13.7% better pp8192 throughput from distribution plus routing-readback bypass; distribution alone did not improve throughput. Those results do not establish performance for this port or other models.
 
 The scheduler distributes host-weight MUL_MAT_ID operations across eligible backends by layer number, keeping gate/up/down on the same backend when their eligible sets match. Unnamed tensors use a round-robin fallback reset for each graph split pass. Only batches of at least 32 tokens use this policy; backend support and offload eligibility still apply. Non-MoE operations keep their original priority order.
 

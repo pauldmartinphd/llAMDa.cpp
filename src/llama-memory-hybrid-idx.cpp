@@ -6,7 +6,6 @@
 
 #include "llama-impl.h"
 #include "llama-batch.h"
-#include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
 
@@ -74,7 +73,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "cache_idx");
+            nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()),
     mem_ple(model.hparams.ple_n_heads == 0 ? nullptr : new llama_memory_recurrent(
             model, GGML_TYPE_F32, GGML_TYPE_F32, offload, rs_size, n_seq_max, n_rs_seq,

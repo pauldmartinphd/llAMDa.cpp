@@ -29,6 +29,8 @@ the section matching the GPU you are building for.
 Unsupported models, shapes, quantizations, and topologies retain the normal
 llama.cpp fallbacks.
 
+Source attribution: [forks, branches, and contributors](CREDITS.md).
+
 ## At a glance
 
 | GPU | Build helper | Runtime profile |

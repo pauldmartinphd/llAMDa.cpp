@@ -510,10 +510,14 @@ static ggml_tensor * build_dflash2_conv(
 
     const int64_t block_size = n_tokens / n_blocks;
     ggml_context * ctx0 = g.ctx0;
-    hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
-    dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
+    // ggml_cont copies even when the tensor is already contiguous
+    if (!ggml_is_contiguous(hidden) || hidden->ne[1] != n_tokens) {
+        hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
+    }
+    if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
+        dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
+    }
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
-    ggml_tensor * grouped = ggml_reshape_3d(ctx0, hidden, group_size, n_groups, n_tokens);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
             coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
@@ -541,15 +545,11 @@ static ggml_tensor * build_dflash2_conv(
         }
         values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
 
-        ggml_tensor * coeff = ggml_view_2d(ctx0, coeffs_side, n_groups, n_tokens,
-                coeffs_side->nb[2], tap * coeffs_side->nb[1]);
-        coeff = ggml_cont(ctx0, coeff);
-        coeff = ggml_reshape_3d(ctx0, coeff, 1, n_groups, n_tokens);
-        coeff = ggml_reshape_2d(ctx0, ggml_repeat(ctx0, coeff, grouped), hidden_size, n_tokens);
+        ggml_tensor * weight = ggml_reshape_2d(ctx0,
+                ggml_cont(ctx0, ggml_view_4d(ctx0, weight_all, group_size, n_groups, 1, n_tokens,
+                        weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2])),
+                hidden_size, n_tokens);
 
-        ggml_tensor * base_tap = ggml_view_1d(ctx0, base, hidden_size,
-                tap * base->nb[1] + side * base->nb[2]);
-        ggml_tensor * weight = ggml_add(ctx0, coeff, ggml_repeat(ctx0, base_tap, hidden));
         ggml_tensor * term = ggml_mul(ctx0, weight, values);
         result = result ? ggml_add(ctx0, result, term) : term;
     }
@@ -558,7 +558,7 @@ static ggml_tensor * build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dflash2_selector(const llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -1126,7 +1126,7 @@ template <bool is_enc>
 void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
     if constexpr (!is_enc) {
         if (model.dflash_selector_hidden && res->t_logits) {
-            build_dflash2_selector(*const_cast<graph *>(this), model, res->get_inp_tokens());
+            build_dflash2_selector(*this, model, res->get_inp_tokens());
         }
     }
 }

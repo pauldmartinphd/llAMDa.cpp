@@ -2786,8 +2786,6 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res += 32*selector_tokens;
     }
 
-    uint32_t n_sampling_nodes = 0;
-    uint32_t n_sampling_nodes_max = 0;
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
     }
