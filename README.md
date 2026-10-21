@@ -1,5 +1,7 @@
 # llama.cpp: Vega development
 
+The shared [MoE prefill patch](docs/moe-prefill-offload.md) distributes eligible expert work by layer, with round-robin fallback, and bypasses routing readback at high selection density. Both parts are enabled by default; set `GGML_MOE_PREFILL=0` for an A/B comparison.
+
 DeepSeek-V4.1 and DSpark now use the shared Daniel Han / Unsloth implementation from `amd-main`. The older V4.1 port is superseded. [Matching models, instructions and known issues](docs/deepseek41.md).
 
 I keep the shared AMD changes in [`amd-main`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/amd-main). This branch carries the remaining work from [mxxm-t/mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) for Vega development, including gfx906 weight repacking, multi-stage tensor parallelism, and speculative decoding work. It includes experimental and opt-in features that have not been promoted to the common branch.

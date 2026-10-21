@@ -3407,7 +3407,13 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
-    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+    const char * moe_prefill = std::getenv("GGML_MOE_PREFILL");
+    const bool prefill_enabled = moe_prefill == nullptr || std::strcmp(moe_prefill, "0") != 0;
+    // Copy all experts at high routing density to avoid a host-blocking ID read.
+    if (prefill_enabled && ids->ne[1] >= 32 && ggml_nelements(ids)/8 >= n_expert) {
+        st.used.assign(n_expert, true);
+        st.ids = ids;
+    } else if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
         ggml_backend_synchronize(backend);

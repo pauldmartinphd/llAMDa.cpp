@@ -22,3 +22,7 @@ The previous combined AMD import was reverted in `9b229d705`. Its source referen
 ## DeepSeek-V4.1 and DSpark
 
 Daniel Han and Unsloth supply the shared DeepSeek-V4.1-Flash-1017 implementation through [PR 30817](https://github.com/ggml-org/llama.cpp/pull/30817), revision `b72050d03ae14bb3cb5138ecefab3f3f65157d31`, retained as an attributed cherry-pick. This replaces the older V4.1 implementation. Upstream llama.cpp supplies the general speculative runtime. See [source review and validation notes](docs/deepseek41.md).
+
+## Multi-GPU MoE prefill distribution
+
+Paul D. Martin, Ph.D., supplies the layer-keyed distribution with round-robin fallback and the routing-readback bypass, adapted from the [performance notebook patch](https://github.com/pauldmartinphd/llm-performance-engineering-notebook/blob/main/patches/prefill/README.md). See [port details and validation](docs/moe-prefill-offload.md). Both are enabled by default for eligible prefill operations; `GGML_MOE_PREFILL=0` disables them.
