@@ -17,3 +17,7 @@ The full CPU build passed on macOS with Metal disabled. Targeted CPU tests cover
 ## Repository automation
 
 GitHub Actions workflows remain identical to amd-main. Source-fork CI deployment and hardware-runner configuration are not adopted by this integration. The source commits remain in history; their workflow changes are explicitly reverted at the branch tip.
+
+## Unsloth rebase
+
+This branch is rebased onto the shared Unsloth V4.1 integration. The DeepSeek-V4.1 model, DSpark decoder and converter now come from amd-main; previous source-fork V4.1 implementations are superseded. See [the current integration](deepseek41.md) for model compatibility and known issues.

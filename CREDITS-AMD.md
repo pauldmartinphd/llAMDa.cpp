@@ -13,8 +13,12 @@ The normalization cherry-pick was adapted to retain upstream's newer vectorized 
 
 The default branch also inherits upstream work for gfx900, RDNA3.5 MMQ, and BF16 fallback on devices without native BF16 acceleration. These are not represented as new work by this fork.
 
-The previous combined AMD import was reverted in `9b229d705`. Its source references remain in Git history; the milpster Vega table and the Strix-Halo transpose/concat import are no longer in the current tree. Credits for the separate V620 model integration remain on `v620-dev`.
+The previous combined AMD import was reverted in `9b229d705`. Its source references remain in Git history; the milpster Vega table and the Strix-Halo transpose/concat import are no longer in the current tree. Historical V620 integration credits remain in Git history.
 
 ## Halo development source
 
 `halo-dev` integrates [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) at `da731374077f2ad9bdffd4848f782b5694b9bb68` with its original commit history and authorship. See [integration notes](docs/halo-dev-integration.md) for local adaptations and validation limits.
+
+## DeepSeek-V4.1 and DSpark
+
+Daniel Han and Unsloth supply the shared DeepSeek-V4.1-Flash-1017 implementation through [PR 30817](https://github.com/ggml-org/llama.cpp/pull/30817), revision `b72050d03ae14bb3cb5138ecefab3f3f65157d31`, retained as an attributed cherry-pick. This replaces the older V4.1 implementation. Upstream llama.cpp supplies the general speculative runtime. See [source review and validation notes](docs/deepseek41.md).
