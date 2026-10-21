@@ -534,6 +534,35 @@ static __device__ __forceinline__ float warp_reduce_max(float x) {
     return x;
 }
 
+// gfx1030 wave reductions use the compiler's native DPP sequence when the
+// caller selected the native path. Keep the existing shuffle implementation
+// as the exact stock fallback and for sub-wave reductions.
+template <bool use_native, int width = WARP_SIZE>
+static __device__ __forceinline__ float ggml_cuda_warp_reduce_sum_gfx1030(float x) {
+#if defined(GGML_USE_HIP) && defined(RDNA2)
+#if __has_builtin(__builtin_amdgcn_wave_reduce_fadd_f32)
+    if constexpr (use_native && width == 32) {
+        return __builtin_amdgcn_wave_reduce_fadd_f32(x, 0);
+    }
+#endif
+#endif
+    GGML_UNUSED(use_native);
+    return warp_reduce_sum<width>(x);
+}
+
+template <bool use_native, int width = WARP_SIZE>
+static __device__ __forceinline__ float ggml_cuda_warp_reduce_max_gfx1030(float x) {
+#if defined(GGML_USE_HIP) && defined(RDNA2)
+#if __has_builtin(__builtin_amdgcn_wave_reduce_fmax_f32)
+    if constexpr (use_native && width == 32) {
+        return __builtin_amdgcn_wave_reduce_fmax_f32(x, 0);
+    }
+#endif
+#endif
+    GGML_UNUSED(use_native);
+    return warp_reduce_max<width>(x);
+}
+
 template<typename T, int width = WARP_SIZE>
 static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
     const int lane_id = threadIdx.x % width;
@@ -845,8 +874,31 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #endif // CUDART_VERSION >= 12050
 }
 
+// Bit-exact software decode for the RDNA2 NVFP4 MMVQ path. UE4M3's
+// normal values map directly onto an FP32 exponent/mantissa field, while its
+// seven subnormal values are exact integer multiples of 2^-10. Keeping the
+// subnormal multiply explicit avoids the much more expensive v_ldexp_f32
+// sequence emitted for the generic implementation on gfx1030.
+static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32_rdna2_exact(uint8_t x) {
+    const uint32_t code = x & 0x7FU;
+
+    if (code < 8) {
+        return float(code) * 0x1.0p-10f;
+    }
+    if (x == 0x7F) { // Preserve the generic software decoder's NaN handling.
+        return 0.0f;
+    }
+
+    const uint32_t bits = 0x3B800000U + (code << 20);
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
 static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
-#if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+#if defined(GGML_USE_HIP) && defined(__gfx1030__)
+    return ggml_cuda_ue4m3_to_fp32_rdna2_exact(x);
+#elif defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
     // ROCm does not support fp8 in software on devices with fp8 hardware,
     // but CDNA3 supports only e4m3_fnuz (no inf).
     const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
