@@ -194,16 +194,29 @@ int main(int argc, char ** argv) {
 
     const auto t_enc_start = ggml_time_us();
 
+    // Evaluate the prompts in n_batch-sized pieces.
+    // A prompt can fit the context while exceeding the logical batch size, and submitting it as one decode trips llama_context's batch-size assertion.
+    // The target's final token stays a decode of its own so its sampling output is unambiguous.
+    auto decode_prompt = [](llama_context * ctx, const llama_token * tokens, int32_t n_tokens) -> bool {
+        const int32_t n_batch = (int32_t) llama_n_batch(ctx);
+
+        common_batch batch = common_batch_get_one(ctx, tokens, n_tokens);
+
+        for (int32_t off = 0; off < n_tokens; off += n_batch) {
+            const int32_t n = std::min(n_batch, n_tokens - off);
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(off, n)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     // eval the prompt with both models
-    {
-        common_batch batch = common_batch_get_one(ctx_tgt, inp.data(), n_input - 1);
-        llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-
-        batch = common_batch_get_one(ctx_tgt, &inp.back(), 1);
-        llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-
-        batch = common_batch_get_one(ctx_dft, inp.data(), n_input);
-        llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    if (!decode_prompt(ctx_tgt, inp.data(), n_input - 1) ||
+        !decode_prompt(ctx_tgt, &inp.back(), 1) ||
+        !decode_prompt(ctx_dft, inp.data(), n_input)) {
+        LOG_ERR("%s: failed to decode the prompt\n", __func__);
+        return 1;
     }
 
     const auto t_enc_end = ggml_time_us();

@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <tuple>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -26,6 +27,7 @@ class llama_moe_cache;
 
 struct llama_memory_context_i;
 
+class llama_kv_cache;
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsa_iswa_context;
@@ -292,6 +294,17 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+
+    // Ring-mode physical destination rows, ordered j + n_seqs*s.
+    // Per-snapshot leaves are first-class inputs because views do not inherit the scheduler's staged-input contract.
+    ggml_tensor * s_write = nullptr; // I32 [n_seqs * n_snap]
+    // The same destinations in sequence-major, oldest-first order for batched convolution writes.
+    ggml_tensor * s_write_conv = nullptr; // I32 [n_seqs * n_snap]
+    std::vector<ggml_tensor *> s_write_slices;
+
+    void fill_s_write(const llama_ubatch * ubatch, const llama_memory_recurrent_context * m);
+    void upload_s_copy(const llama_memory_recurrent_context * m, int64_t n_seqs_ub);
+    int64_t n_snap = 0;
 
     const llama_memory_recurrent_context * mctx;
 
@@ -833,6 +846,13 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // optional persistent device tensors for the layer-input taps, indexed by lid.
+    // When present, set_outputs copies each tap into its tensor in-graph instead of
+    // pinning it as an output, keeping the tap out of the galloc arena - taps in the
+    // arena change the packing so runtime graphs stop fitting the reserved plan and
+    // every prefill chunk pays a re-reserve plus an all-backend synchronize.
+    const std::vector<ggml_tensor *> * layer_inp_dev = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1077,6 +1097,15 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // rows this graph wrote per (cache, layer, is V), and the replicas already filled from them
+    struct kv_rows {
+        ggml_tensor * cur;
+        ggml_tensor * idxs;
+    };
+
+    mutable std::map<std::tuple<const llama_kv_cache *, int32_t, bool>, kv_rows> kv_rows_written;
+    mutable std::set<std::tuple<const llama_kv_cache *, int32_t, bool>> kv_replicas_filled;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
@@ -1254,6 +1283,15 @@ struct llm_graph_context {
     // attention
     //
 
+    // cache writes and reads that keep the replica of a reused layer in step (see llama_kv_cache::get_replica_id)
+    template <typename mctx_t>
+    void build_cpy_k(const mctx_t * mctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int il) const;
+    template <typename mctx_t>
+    ggml_tensor * build_get_k(const mctx_t * mctx, int il) const;
+
+    void build_cpy_v(const llama_kv_cache_context * mctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int il) const;
+    ggml_tensor * build_get_v(const llama_kv_cache_context * mctx, int il) const;
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
@@ -1296,6 +1334,15 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
+                    int   il) const;
+
+    // Phase 2b: store ONLY k_cur/v_cur into the KV cache (the store half of build_attn, no
+    // attention/output). Used by the MTP head's KV-only prefill replay. Mirrors build_attn's
+    // store block exactly so the stored K/V are bit-identical to the full path.
+    void build_attn_store_kv(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
                     int   il) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;

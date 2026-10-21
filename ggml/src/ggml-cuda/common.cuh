@@ -331,6 +331,10 @@ static bool fp16_mma_hardware_available(const int cc) {
 }
 
 // To be used for feature selection of external libraries, e.g. cuBLAS.
+// AMD GPUs without native bfloat16 (pre-CDNA, pre-RDNA3) have no tuned rocBLAS
+// bf16 GEMM and fall back to a stub kernel, so computing in F32 is much faster
+// there. Measured on gfx906/Vega20: a bf16 GEMM picks a 64x32x8 macro-tile and
+// runs 3.5x slower than the F32 path on the same weights.
 static bool fast_bf16_hardware_available(const int cc) {
         return (GGML_CUDA_CC_IS_AMD(cc) && (cc >= GGML_CUDA_CC_RDNA3 || GGML_CUDA_CC_IS_CDNA(cc)))
             || (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE);
@@ -959,6 +963,12 @@ typedef void (*dequantize_kernel_t)(const void * vx, const int64_t ib, const int
 template<typename dst_t>
 using dequantize_kq_t = void (*)(const void * vx, const int64_t ib, dst_t * y, const int tid);
 
+// Same, but bounded by how many 32-value sub-blocks of the super-block belong to the
+// row. Lets get_rows serve rows whose width is a multiple of the native block but not
+// of QK_K (qwen4exp PLE table: 160 = 5 x 32).
+template <typename dst_t>
+using dequantize_kq_n_t = void (*)(const void * vx, const int64_t ib, dst_t * y, const int tid, const int n_sub);
+
 static __device__ __forceinline__ float get_alibi_slope(
     const float max_bias, const uint32_t h, const uint32_t n_head_log2, const float m0, const float m1
 ) {
@@ -1201,6 +1211,10 @@ struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
+    // Pools without recovery keep the regular fail-fast behavior.
+    virtual void * try_alloc(size_t size, size_t * actual_size) {
+        return alloc(size, actual_size);
+    }
     virtual void free(void * ptr, size_t size) = 0;
 };
 
@@ -1220,9 +1234,7 @@ struct ggml_cuda_pool_alloc {
     }
 
     ~ggml_cuda_pool_alloc() {
-        if (ptr != nullptr) {
-            pool->free(ptr, actual_size);
-        }
+        reset();
     }
 
     // size is in number of elements
@@ -1236,6 +1248,21 @@ struct ggml_cuda_pool_alloc {
     T * alloc(ggml_cuda_pool & pool, size_t size) {
         this->pool = &pool;
         return alloc(size);
+    }
+
+    T * try_alloc(size_t size) {
+        GGML_ASSERT(pool != nullptr);
+        GGML_ASSERT(ptr == nullptr);
+        ptr = (T *) pool->try_alloc(size * sizeof(T), &this->actual_size);
+        return ptr;
+    }
+
+    void reset() {
+        if (ptr != nullptr) {
+            pool->free(ptr, actual_size);
+            ptr = nullptr;
+            actual_size = 0;
+        }
     }
 
     T * get() {
@@ -1276,9 +1303,18 @@ struct ggml_cuda_graph {
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
+    bool disable_due_to_memory = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // kernel functions of the last capture, to detect function changes that
+    // hipGraphExecUpdate would apply without validating launch geometry
+    std::vector<const void *> kernel_funcs;
+    // graphs never amortize for entries whose properties keep changing
+    // (spec decode churns shapes and KV pointers) - they self-disable
+    int n_prop_checks = 0;
+    int n_prop_resets = 0;
+    bool unstable_disabled = false;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1289,7 +1325,7 @@ struct ggml_cuda_graph {
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+        return !(disable_due_to_gpu_arch || disable_due_to_memory || unstable_disabled || disable_cuda_graphs_due_to_env);
     }
 #endif
 };
@@ -1448,12 +1484,47 @@ struct ggml_cuda_stream_context {
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
+    // Upload-only backends use the per-thread stream so temporary model-load copies do not
+    // create/destroy normal HIP streams before the compute backend is initialized.
+    bool copy_only = false;
     cudaEvent_t copy_event = nullptr;
 
-    cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-    size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
+    // Dedicated stream + events for the meta-backend stage-transfer copies. Using a side
+    // stream avoids serializing the cross-stage memcpy behind compute on the main stream,
+    // so the next ubatch's stage-A compute can start on the source GPU while the prior
+    // ubatch's stage-A->stage-B copy is still in flight on the dedicated stream.
+    cudaStream_t pp_copy_stream  = nullptr;
+    cudaEvent_t  pp_copy_event_a = nullptr; // src main -> pp_copy_stream
+    cudaEvent_t  pp_copy_event_b = nullptr; // pp_copy_stream -> dst main
+
+    cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+
+    // Remember a smaller split flash-attention workspace after an allocation failure.
+    int fattn_parallel_blocks_cap = 0;
+    bool fattn_parallel_blocks_override_logged = false;
+    // Preserve a working row chunk after TOP_K encounters memory pressure. Retrying
+    // the known-too-large allocation in every layer would force a device-wide pool
+    // flush and make deep prefill needlessly expensive.
+    int64_t top_k_workspace_rows_cap = 0;
+    bool top_k_workspace_rows_cap_logged = false;
+    // Maximum MMQ output columns known to fit its quantized-activation workspace.
+    // Zero keeps the original full-width path until actual memory pressure occurs.
+    int64_t mmq_workspace_cols_cap = 0;
+    bool mmq_workspace_cols_cap_logged = false;
+    int64_t mmq_id_workspace_tokens_cap = 0;
+    bool mmq_id_workspace_tokens_cap_logged = false;
+    int64_t repack_workspace_cols_cap = 0;
+    bool repack_workspace_cols_cap_logged = false;
+    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+    size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
+
+#if defined(GGML_USE_HIP)
+    // Pinned-host scratch for set_tensor_2d_async's misaligned-row workaround. See the
+    // comment at ggml_backend_cuda_set_tensor_2d_async for the why.
+    void * hip_set2d_scratch_ptr = nullptr;
+    size_t hip_set2d_scratch_cap = 0;
+#endif
 
     int curr_stream_no = 0;
 
@@ -1461,6 +1532,9 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+
+    // set once by an owner that captures and replays whole tokens itself
+    bool graphs_owner_disabled = false;
 
     int64_t last_graph_eviction_sweep = 0;
 
@@ -1509,16 +1583,48 @@ struct ggml_backend_cuda_context {
     }
 #endif // USE_CUDA_GRAPH
 
-    explicit ggml_backend_cuda_context(int device) :
+    explicit ggml_backend_cuda_context(int device, bool copy_only = false) :
         device(device),
-        name(GGML_CUDA_NAME + std::to_string(device)) {
+        name(GGML_CUDA_NAME + std::to_string(device)),
+        copy_only(copy_only) {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
 
+    // Quantized copies of activations already produced during this graph
+    // evaluation, so repeated matmuls off one activation quantize it once.
+    struct q8_1_cache_entry {
+        const ggml_tensor * src1 = nullptr;
+        const void *        data = nullptr;
+        int64_t             ne[4]      = { 0, 0, 0, 0 };
+        int64_t             stride[3]  = { 0, 0, 0 };
+        int64_t             ne_padded  = 0;
+        size_t              nbytes     = 0;
+        int                 variant    = -1;
+        char *              buf        = nullptr;
+        // ggml_cuda_pool_alloc deletes both copy and move, so it cannot be held by
+        // value in a vector - the indirection is required, not stylistic.
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> alloc;
+    };
+    std::vector<q8_1_cache_entry> q8_1_cache;
+    size_t q8_1_cache_hits   = 0;
+    size_t q8_1_cache_misses = 0;
+    size_t q8_1_cache_peak   = 0; // most entries alive at once, over the run
+    bool q8_1_cache_pressure_logged = false;
+    bool cublas_chunk_logged = false;
+    void q8_1_cache_reset() {
+        q8_1_cache.clear();
+    }
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
+        if (copy_only) {
+            GGML_ASSERT(device == this->device);
+            GGML_ASSERT(stream == 0);
+            ggml_cuda_set_device(device);
+            return cudaStreamPerThread;
+        }
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
             CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
@@ -1715,3 +1821,12 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+// Defined in ggml-cuda.cu. Hands back the quantized copy of src1 made earlier in
+// this graph evaluation, or returns nullptr so the caller allocates and quantizes
+// itself. `variant` separates layouts that are not interchangeable, since only an
+// identical layout may be shared.
+char * ggml_cuda_q8_1_cache_acquire(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int variant,
+        int64_t ne_padded, int64_t s11, int64_t s12, int64_t s13,
+        size_t nbytes, bool & hit, bool * pressure = nullptr);

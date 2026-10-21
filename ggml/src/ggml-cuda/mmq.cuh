@@ -223,11 +223,16 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-rdna3.cuh"
 #include "mmq-config-rdna3-5.cuh"
 #include "mmq-config-rdna4.cuh"
+#include "mmq-config-gfx906.cuh" // gfx906 wraps the GCN and rdna2 tables, must be included after them
 
 #undef CASE
 
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
+        // gfx906 takes the GCN table with its own MXFP4 rows, so it is tested ahead of the GCN range that also covers Vega20.
+        if (cc == GGML_CUDA_CC_VEGA20) {
+            return ggml_cuda_mmq_get_config_gfx906(type, J, fallback);
+        }
         if (GGML_CUDA_CC_IS_GCN(cc)) {
             return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
         }
@@ -263,7 +268,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
 #ifdef GGML_USE_HIP
-#ifdef GCN
+#if defined(__gfx906__)
+    return ggml_cuda_mmq_get_config_gfx906(type, J, fallback);
+#elif defined(GCN)
     return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
 #elif defined(CDNA)
     return ggml_cuda_mmq_get_config_cdna(type, J, fallback);

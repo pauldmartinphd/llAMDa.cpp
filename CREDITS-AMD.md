@@ -14,3 +14,7 @@ The normalization cherry-pick was adapted to retain upstream's newer vectorized 
 The default branch also inherits upstream work for gfx900, RDNA3.5 MMQ, and BF16 fallback on devices without native BF16 acceleration. These are not represented as new work by this fork.
 
 The previous combined AMD import was reverted in `9b229d705`. Its source references remain in Git history; the milpster Vega table and the Strix-Halo transpose/concat import are no longer in the current tree. Credits for the separate V620 model integration remain on `v620-dev`.
+
+## Vega development source
+
+`vega-dev` integrates [mxxm-t/mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) at `c4d12e2c0094c9028318bed5bb1a30bb48f8a35b` with its original commit history and authorship. See [integration notes](docs/vega-dev-integration.md) for local adaptations and validation limits.

@@ -585,12 +585,6 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
             add_t, add_stride_row, add_stride_channel, add_stride_sample,
             add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, stream);
     }
-    };
-    if (clamped_grid) {
-        launch(std::true_type{});
-    } else {
-        launch(std::false_type{});
-    }
 }
 
 static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {

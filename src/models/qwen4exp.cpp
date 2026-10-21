@@ -59,7 +59,22 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
+    {
+        // compress_ratios may carry n_layer entries (trunk only) or n_layer_all entries.
+        // Accept both lengths: entries the file carries are used as written, a head the file says nothing about runs with dense attention.
+        std::vector<uint32_t> cr;
+        if (ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, cr, false)
+                && cr.size() >= hparams.n_layer() && cr.size() <= hparams.n_layer_all) {
+            for (size_t il = 0; il < cr.size(); ++il) {
+                hparams.dsv4_compress_ratios[il] = cr[il];
+            }
+            for (uint32_t il = (uint32_t) cr.size(); il < hparams.n_layer_all; ++il) {
+                hparams.dsv4_compress_ratios[il] = 0;
+            }
+        } else {
+            ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
+        }
+    }
 
     // QSA pools the indexer keys of blocks of compress_ratio cells, one block size for the whole model
     hparams.indexer_kpool = 0;
@@ -291,7 +306,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         load_block(il, mtp_flags);
 
         auto & nextn = layers[il].nextn;
-        nextn.eh_proj      = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,      "weight", il), { 2*n_embd, n_embd }, mtp_flags);
+        // Heads converted with two square projections carry fc_hidden next to a square eh_proj, fused heads carry one [2*n_embd, n_embd] eh_proj.
+        const std::string eh_name = tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il).str();
+        const auto * eh_meta  = ml.get_tensor_meta(eh_name.c_str());
+        const bool   eh_split = eh_meta != nullptr && eh_meta->ne[0] == n_embd;
+
+        nextn.eh_proj      = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,      "weight", il), { eh_split ? n_embd : 2*n_embd, n_embd }, mtp_flags);
+        nextn.fc_hidden    = create_tensor(tn(LLM_TENSOR_NEXTN_FC_HIDDEN,    "weight", il), { n_embd, n_embd }, eh_split ? mtp_flags : TENSOR_NOT_REQUIRED);
         nextn.enorm        = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,        "weight", il), { n_embd }, mtp_flags);
         // RMS per hc stream of the trunk residual, so the gammas load as [n_embd, hc] like the mixer norms
         nextn.hnorm        = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,        "weight", il), { n_embd, hc }, mtp_flags | TENSOR_ALLOW_RESHAPE);
@@ -401,6 +422,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     const int64_t hc = hparams.dsv4_hc_mult;
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
+
+    // A head-only file has no trunk, so the layer loop would dereference tensors it never carried.
+    if (n_layer > 0 && model.layers[0].hc_attn_norm == nullptr) {
+        throw std::runtime_error("this GGUF contains only the NextN/MTP head, load it as a draft model instead");
+    }
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -534,6 +560,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm && layer.nextn.hc_head_norm &&
             "MTP block missing, load the model with MTP enabled");
+    GGML_ASSERT((layer.nextn.fc_hidden || layer.nextn.eh_proj->ne[0] == 2*n_embd) && "MTP block missing nextn.fc_hidden");
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -569,7 +596,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
     llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
+    // A dense head never reads the k-pool inputs, and an input the graph does not read is left without a buffer.
+    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0 && hparams.dsv4_compress_ratios[il] > 0) {
         GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
         inp_kpool = build_inp_kpool(mctx_hyb);
@@ -585,7 +613,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)); // [n_embd, hc, n_tokens]
+    // [n_embd, hc, n_tokens]
+    ggml_tensor * res_hc;
+    if (layer.nextn.fc_hidden) {
+        // split layout: eh_proj reads the embedding side and fc_hidden the hidden side, summed per hc stream
+        res_hc = ggml_add(ctx0,
+                build_lora_mm(layer.nextn.eh_proj,   e_norm),
+                build_lora_mm(layer.nextn.fc_hidden, h_norm));
+    } else {
+        res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0));
+    }
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
@@ -1068,7 +1105,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+            conv_kernel_size - 1, conv_channels, il, /* keep_snapshots = */ true);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -1291,6 +1328,26 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
+static ggml_tensor * qwen4exp_conv_windows(
+        ggml_context * ctx0, ggml_tensor * conv_input,
+        int64_t state_cols, int64_t channels, int64_t n_seqs, int64_t n_snap, int64_t n_planes) {
+    const int64_t n_new_cols = conv_input->ne[0] - state_cols;
+    GGML_ASSERT(n_snap > 0 && n_snap <= n_new_cols && n_snap <= n_planes);
+    const int64_t first_col = n_new_cols - n_snap + 1;
+    ggml_tensor * windows = nullptr;
+    for (int64_t snap = 0; snap < n_planes; ++snap) {
+        ggml_tensor * window = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, first_col + std::min(snap, n_snap - 1)));
+        window = ggml_reshape_3d(ctx0, ggml_cont(ctx0, window), state_cols * channels, 1, n_seqs);
+        windows = windows == nullptr ? window : ggml_concat(ctx0, windows, window, 1);
+    }
+    windows = ggml_view_3d(ctx0, windows, state_cols * channels, n_snap, n_seqs,
+            windows->nb[1], windows->nb[2], 0);
+    return ggml_cont(ctx0, windows);
+}
+
 // Read a conv history out of its own recurrent row and write the new tail back.
 // The shared build_conv_state cannot do this: qwen4exp has two such rows per layer.
 ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
@@ -1299,7 +1356,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        bool                 keep_snapshots) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
@@ -1321,28 +1379,82 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
 
-    // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
-    // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
-    const uint32_t mem_size = mctx_cur->get_size();
+    const int64_t n_new_cols = conv_input->ne[0] - state_cols;
 
-    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
+    if (keep_snapshots && inp->s_write_conv != nullptr) {
+        GGML_ASSERT(inp->n_snap > 0 && inp->n_snap <= n_new_cols);
 
-    for (int64_t slot = 0; slot < n_slots; ++slot) {
-        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+        // One window per ring plane, cropped back to the snapshots this batch really has.
+        // The node count is therefore constant across chunks, which keeps the scheduler plan.
+        ggml_tensor * windows = qwen4exp_conv_windows(ctx0, conv_input, state_cols, channels,
+                n_seqs, inp->n_snap, mctx_cur->get_n_planes());
+        GGML_ASSERT(windows->ne[0] == row_total);
+        GGML_ASSERT(windows->ne[1] == inp->n_snap);
+        GGML_ASSERT(windows->ne[2] == n_seqs);
 
-        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-                state_cols, channels, n_seqs,
-                conv_input->nb[1], conv_input->nb[2],
-                ggml_row_size(conv_input->type, s_idx));
+        ggml_tensor * flat = ggml_reshape_2d(
+                ctx0, windows, row_total, n_seqs * inp->n_snap);
 
-        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-                state_cols * channels, n_seqs,
-                conv_states_all->nb[1],
-                (slot * mem_size + kv_head) * row_size);
-
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        GGML_ASSERT(inp->s_write_conv->ne[0] == n_seqs * inp->n_snap);
+        ggml_build_forward_expand(gf,
+                ggml_set_rows(ctx0, conv_states_all, flat, inp->s_write_conv));
+        return conv_input;
     }
+
+    // Parallel contexts deliberately retain the plane-indexed implementation until ring histories can be migrated when seq_cp() descendants diverge into different cells.
+    // Preserve all bounded-rollback snapshots here:
+    // newest windows come from this ubatch and the older survivors are staged before the destination planes are overwritten.
+    if (keep_snapshots && cparams.n_rs_seq > 0) {
+        const int64_t  K            = (int64_t) cparams.n_rs_seq + 1;
+        const uint32_t mem_size     = mctx_cur->get_size();
+        const int64_t  n_from_input = std::max<int64_t>(1, std::min<int64_t>(K, n_new_cols));
+        const int64_t  n_keep       = K - n_from_input;
+
+        ggml_tensor * shifted = nullptr;
+        if (n_keep > 0) {
+            ggml_tensor * old_planes = ggml_view_3d(ctx0, conv_states_all,
+                    row_total, n_seqs, n_keep,
+                    conv_states_all->nb[1],
+                    (size_t) mem_size * row_size,
+                    (size_t) kv_head * row_size);
+            shifted = ggml_cont(ctx0, old_planes);
+            ggml_build_forward_expand(gf, shifted);
+        }
+
+        for (int64_t snap = 0; snap < n_from_input; ++snap) {
+            ggml_tensor * window = ggml_view_3d(ctx0, conv_input,
+                    state_cols, channels, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, n_new_cols - snap));
+            ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                    row_total, n_seqs, conv_states_all->nb[1],
+                    ((size_t) snap * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, window), dst));
+        }
+
+        if (shifted != nullptr) {
+            ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all,
+                    row_total, n_seqs, n_keep,
+                    conv_states_all->nb[1],
+                    (size_t) mem_size * row_size,
+                    (size_t) (kv_head + (uint32_t) n_from_input * mem_size) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, shifted, dst));
+        }
+
+        return conv_input;
+    }
+
+    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+            state_cols, channels, n_seqs,
+            conv_input->nb[1], conv_input->nb[2],
+            ggml_row_size(conv_input->type, n_new_cols));
+
+    ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+            row_total, n_seqs, conv_states_all->nb[1],
+            kv_head * row_size);
+
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
 
     return conv_input;
 }
@@ -1422,7 +1534,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
     ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
-            hist, hc_dim, il);
+            hist, hc_dim, il, /* keep_snapshots = */ true);
 
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {

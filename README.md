@@ -1,25 +1,38 @@
-# llama.cpp for AMD
+# llama.cpp: Vega development
 
-I maintain this fork to bring useful AMD performance work into one place without requiring a collection of custom launchers. The hardware I care about includes older Vega cards, RDNA2 cards such as the Radeon Pro V620, and Strix Halo. These systems have different execution and memory constraints, so a change that helps one of them needs an appropriate device or workload condition before it becomes a default for the others.
+I keep the shared AMD changes in [`amd-main`](https://github.com/pauldmartinphd/llama.cpp/tree/amd-main). This branch carries the remaining work from [mxxm-t/mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) for Vega development, including gfx906 weight repacking, multi-stage tensor parallelism, and speculative decoding work. It includes experimental and opt-in features that have not been promoted to the common branch.
 
-The default branch, **`amd-main`**, follows upstream llama.cpp with selected commits cherry-picked from AMD-focused forks. I keep the source authors and commit references, check whether upstream already includes the change, and document the evidence for retaining it. The intent is to carry a small, reviewable set of changes that works through the normal build and runtime options. Performance claims apply to the hardware, model, and workload that produced them.
+The source history and authorship are preserved. Integration details, source revision and validation limits are in [the integration notes](docs/vega-dev-integration.md). Shared patch credits are in [CREDITS-AMD.md](CREDITS-AMD.md).
 
-## Branches and current scope
+The development branches are [`rdna-dev`](https://github.com/pauldmartinphd/llama.cpp/tree/rdna-dev), [`halo-dev`](https://github.com/pauldmartinphd/llama.cpp/tree/halo-dev), and [`vega-dev`](https://github.com/pauldmartinphd/llama.cpp/tree/vega-dev).
 
-| Branch | Purpose |
-| --- | --- |
-| **`amd-main`** | Upstream-based AMD integration and the default branch. Current additions cover normalization dispatch, Vulkan UMA readback, and RDNA3 Q8_0/MXFP4 decode. |
-| `v620-dev` | The broader V620 development branch, including the DeepSeek-V4.1/DSpark integration, cache experiments, and sidecar work. |
-| `master` | The upstream tracking branch. |
+## Source fork documentation
 
-Model support on `amd-main` follows its upstream base. Use `v620-dev` for the additional DeepSeek-V4.1/DSpark work until that integration has been brought forward separately.
+The documentation below comes from the source fork. Its hardware measurements and recommendations describe that fork's testing, not validation of this integration.
 
-The current patch selection has source-reported AMD measurements, but this branch has not yet been built or benchmarked on AMD hardware locally. CPU build and regression results establish that the surrounding code still works; they do not establish HIP kernel correctness or a model throughput gain. I record that distinction in the [patch audit and validation notes](docs/amd-main.md).
+<!-- fork banner -->
+> **mx-llama.cpp** - a fork of llama.cpp for multi-GPU inference. Backend-generic,
+> kernel tuning for AMD gfx906 (MI50).
+> Images: **[mxxm/mx-llama.cpp](https://hub.docker.com/r/mxxm/mx-llama.cpp)**
 
-[Build instructions and patch audit](docs/amd-main.md) · [Source credits](CREDITS-AMD.md)
+```
+-sm tensor          [0 1 2 3 4 5 6 7]                  upstream: one group, all layers
+-sm tensor -tps 2   [0 1] -> [2 3] -> [4 5] -> [6 7]   4 groups of 2, pipelined
+```
+
+| | |
+|---|---|
+| **Multi-stage tensor parallelism** | `-tps T` groups the GPUs and pipelines layers across the groups |
+| **DeepSeek-V4-Flash on `-sm tensor`** | fork routing kept after upstream's own split landed: GPU-side lightning indexer at any context length, static rollback topology |
+| **DeepSeek-V4.1-Flash on `-sm layer`** | architecture support: compressed tiers driven by model metadata, hyper-connection mix shifted by one sublayer, head fold without `output_hc_*` tensors, Engram n-gram hash memory read on demand from two 48.6 GiB tables |
+| **Qwen3.8-Flash-Next on `-sm tensor`** | PLE gather table sharded across the TP group (27 GiB on UD-Q4_K_XL, larger at higher quants), opt-in load-time prefault of that table, NextN/MTP draft head, lazy tensor read under `-lm dio` |
+| **Speculative decoding** | MTP draft heads on Qwen3.6 and Qwen3.8-Flash-Next, DSpark on DeepSeek-V4-Flash, DFlash, all under tensor parallelism, MTP KV staging, recurrent state rewound from a snapshot ring instead of rebuilt |
+| **Custom GPU AllReduce** | peer-write, beats the RCCL ring for generation over PCIe |
+| **Weight repack** | GPU-side weight layout for gfx906, on by default, all split modes: Q8_0, MXFP4, IQ4_NL, Q4_K, Q5_K, Q6_K and Q5_1. Q8_0 path by [iacopPBK](https://github.com/iacopPBK) |
+
+[FEATURES.md](FEATURES.md) - flags, measurements, scope. Base: upstream `b11553`.
 
 ---
-
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
