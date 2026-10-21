@@ -1,7 +1,5 @@
 # llama.cpp
 
-This fork develops automatic AMD backend improvements on **`amd-main`**, based on upstream `master`. Use the normal CMake build and llama.cpp commands; no custom launcher is required. See [AMD coverage, builds, and validation](docs/amd-main.md) and [source credits](CREDITS-AMD.md). The separate `v620-dev` branch retains the broader model, cache, topology, and sidecar integration.
-
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
