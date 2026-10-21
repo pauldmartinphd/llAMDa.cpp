@@ -8,7 +8,7 @@ The default branch, **`amd-main`**, follows upstream llama.cpp with selected com
 
 | Branch | Purpose |
 | --- | --- |
-| **`amd-main`** | Upstream-based AMD integration and the default branch. Current additions cover normalization dispatch, Vulkan UMA readback, RDNA3 Q8_0/MXFP4 decode, and Unsloth DeepSeek-V4.1/DSpark support. |
+| **`amd-main`** | Upstream-based AMD integration and the default branch. Current additions cover normalization dispatch, Vulkan UMA readback, RDNA3 Q8_0/MXFP4 decode, Unsloth DeepSeek-V4.1/DSpark support, and layer-balanced MoE prefill offload. |
 | `rdna-dev` | The broader V620 development branch, including cache experiments, architecture-specific kernels, and sidecar work. |
 | `halo-dev` | Strix Halo development work from halo-box/strix-llama.cpp, integrated onto the common AMD base. |
 | `vega-dev` | Vega development work from mxxm-t/mx-llama.cpp, integrated onto the common AMD base. |
@@ -18,7 +18,7 @@ The default branch, **`amd-main`**, follows upstream llama.cpp with selected com
 
 The current patch selection has source-reported AMD measurements, but this branch has not yet been built or benchmarked on AMD hardware locally. CPU build and regression results establish that the surrounding code still works; they do not establish HIP kernel correctness or a model throughput gain. I record that distinction in the [patch audit and validation notes](docs/amd-main.md).
 
-[Build instructions and patch audit](docs/amd-main.md) · [Source credits](CREDITS-AMD.md)
+[MoE round-robin prefill patch](docs/moe-prefill-offload.md) · [Build instructions and patch audit](docs/amd-main.md) · [Source credits](CREDITS-AMD.md)
 
 ---
 
