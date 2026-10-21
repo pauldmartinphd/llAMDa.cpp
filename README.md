@@ -1,8 +1,10 @@
 # llama.cpp: RDNA development
 
+DeepSeek-V4.1 and DSpark now use the shared Daniel Han / Unsloth implementation from `amd-main`. The older V4.1 port is superseded. [Matching models, instructions and known issues](docs/deepseek41.md).
+
 `rdna-dev` is the RDNA2/RDNA3 development branch of my AMD llama.cpp fork. It carries the former `v620-dev` integration, rebased onto `amd-main`, including the V620 kernels, DeepSeek-V4.1/DSpark support, expert-cache experiments, and model-specific sidecars. The broader development features retain their own build and runtime requirements.
 
-The default branch, [`amd-main`](https://github.com/pauldmartinphd/llama.cpp/tree/amd-main), contains the selected common AMD patches. [`halo-dev`](https://github.com/pauldmartinphd/llama.cpp/tree/halo-dev) and [`vega-dev`](https://github.com/pauldmartinphd/llama.cpp/tree/vega-dev) carry the corresponding architecture development work. Source credits are in [CREDITS.md](CREDITS.md) and [CREDITS-AMD.md](CREDITS-AMD.md).
+The default branch, [`amd-main`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/amd-main), contains the selected common AMD patches. [`halo-dev`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/halo-dev) and [`vega-dev`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/vega-dev) carry the corresponding architecture development work. Source credits are in [CREDITS.md](CREDITS.md) and [CREDITS-AMD.md](CREDITS-AMD.md).
 
 This fork keeps the RDNA2/gfx1030 and RDNA3/gfx1100 paths separate. Use only
 the section matching the GPU you are building for.
