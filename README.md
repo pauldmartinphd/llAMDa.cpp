@@ -1,3 +1,25 @@
+# llama.cpp for AMD
+
+I maintain this fork to bring useful AMD performance work into one place without requiring a collection of custom launchers. The hardware I care about includes older Vega cards, RDNA2 cards such as the Radeon Pro V620, and Strix Halo. These systems have different execution and memory constraints, so a change that helps one of them needs an appropriate device or workload condition before it becomes a default for the others.
+
+The default branch, **`amd-main`**, follows upstream llama.cpp with selected commits cherry-picked from AMD-focused forks. I keep the source authors and commit references, check whether upstream already includes the change, and document the evidence for retaining it. The intent is to carry a small, reviewable set of changes that works through the normal build and runtime options. Performance claims apply to the hardware, model, and workload that produced them.
+
+## Branches and current scope
+
+| Branch | Purpose |
+| --- | --- |
+| **`amd-main`** | Upstream-based AMD integration and the default branch. Current additions cover normalization dispatch, Vulkan UMA readback, and RDNA3 Q8_0/MXFP4 decode. |
+| `v620-dev` | The broader V620 development branch, including the DeepSeek-V4.1/DSpark integration, cache experiments, and sidecar work. |
+| `master` | The upstream tracking branch. |
+
+Model support on `amd-main` follows its upstream base. Use `v620-dev` for the additional DeepSeek-V4.1/DSpark work until that integration has been brought forward separately.
+
+The current patch selection has source-reported AMD measurements, but this branch has not yet been built or benchmarked on AMD hardware locally. CPU build and regression results establish that the surrounding code still works; they do not establish HIP kernel correctness or a model throughput gain. I record that distinction in the [patch audit and validation notes](docs/amd-main.md).
+
+[Build instructions and patch audit](docs/amd-main.md) · [Source credits](CREDITS-AMD.md)
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
