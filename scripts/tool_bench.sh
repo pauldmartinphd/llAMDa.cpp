@@ -4,7 +4,7 @@ set -euo pipefail
 cmake --build build -j
 
 export LLAMA_CACHE=${LLAMA_CACHE:-$HOME/Library/Caches/llama.cpp}
-export LLAMA_SERVER_BIN_PATH=$PWD/build/bin/llama-server
+export LLAMA_SERVER_BIN_PATH=$PWD/build/bin/llamda-server
 
 if [ ! -x "$LLAMA_SERVER_BIN_PATH" ]; then
     echo "Could not find llama-server binary at $LLAMA_SERVER_BIN_PATH"

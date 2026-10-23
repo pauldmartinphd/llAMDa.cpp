@@ -15,4 +15,4 @@ dir="build-bisect"
 rm -rf ${dir} > /dev/null
 cmake -B ${dir} -S . ${cmake_args} > /dev/null
 cmake --build ${dir} -t llama-results -j $(nproc) > /dev/null
-${dir}/bin/llama-results "${llama_results_args[@]}"
+${dir}/bin/llamda-results "${llama_results_args[@]}"

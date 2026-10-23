@@ -37,7 +37,7 @@ Use the appropriate GPU target and a separate build directory for other architec
 MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf
 DSPARK_MODEL=/models/DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf
 
-build/bin/llama-server -m "$MODEL" \
+build/bin/llamda-server -m "$MODEL" \
   --model-draft "$DSPARK_MODEL" --spec-type draft-dspark \
   -ngl 99 --cpu-moe --split-mode layer --tensor-split 1,1,1,1 \
   --spec-draft-ngl 99 --spec-draft-cpu-moe \

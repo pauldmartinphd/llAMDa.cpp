@@ -269,6 +269,8 @@ if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     add_subdirectory(tools/mtmd)
 endif()
 
+include(cmake/llamda-executables.cmake)
+
 #
 # install
 #
