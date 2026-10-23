@@ -397,8 +397,8 @@ Use `--moe-cache-mib` to compare cache budgets, including `0` for the disabled b
 
 ```sh
 ./build/bin/llamda-bench -m /path/to/model.gguf \
-  -ngl 99 -ncmoe 999 --split-mode layer --tensor-split 1,1,1,1 \
-  --moe-cache-mib 0,4096,8192 -fa 1 -t 32 -p 512 -n 128 -r 5 -o jsonl
+  -ngl 99 -ncmoe 999 --split-mode layer \
+  --moe-cache-mib 0,4096,8192 -fa on -t 32 -p 512 -n 128 -r 5 -o jsonl
 ```
 
 `-ncmoe 999` keeps routed experts in host memory for models with up to 999 layers; dense and shared-expert weights remain eligible for GPU placement. The cache budget is total across devices, divided like the layers, not a budget per GPU. Leave enough VRAM for the cache, dense weights, KV cache, and compute buffers.
@@ -406,3 +406,23 @@ Use `--moe-cache-mib` to compare cache budgets, including `0` for the disabled b
 The budget supports the same lists and ranges as other benchmark parameters, for example `0-8192+4096`. Each combination creates a fresh context and expert cache. Warmup and repetitions within that combination reuse the cache; clearing KV memory does not clear expert weights. `--no-warmup -r 1` measures a single initially cold run. Normal repetitions include cache population and reuse, rather than guaranteeing a fully warm cache. Synthetic benchmark tokens may have different expert reuse from real prompts.
 
 JSON, JSONL, CSV, and SQL include `moe_cache_mib`; Markdown shows the column when a nondefault budget or sweep is selected. This records the requested budget, not measured cache occupancy. Use `-v` for the existing cache allocation and hit/miss diagnostics on stderr. These benchmarks measure target inference, not MTP or DSpark acceptance.
+
+### Automatic GPU splitting
+
+You do not need `--tensor-split` to use multiple GPUs. With the default layer split, the loader divides GPU layers according to available VRAM. Four V620s with similar free memory should receive similar shares. To request equal shares explicitly, use `--tensor-split 1/1/1/1` in `llamda-bench`. The benchmark uses commas to separate independent test configurations; `1,1,1,1` does not specify a four-GPU split here.
+
+### GLM-5.3-Flash on four V620s
+
+This command keeps routed expert weights in host memory and requests a 96 GiB total GPU expert cache, with automatic GPU splitting:
+
+```sh
+llamda-bench -m /models/GLM-5.3-Flash/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf -ngl 99 -ot "exps=CPU" --moe-cache-mib 98304 -fa on -t 32 -b 8192 -ub 8192 -p 8192 -n 256 -r 2 -o md
+```
+
+Change the model path to match your installation. `98304` MiB is 96 GiB across all GPUs, approximately 24 GiB per GPU with an equal split. This is a requested budget, not a validated allocation for this model and batch size. The remaining VRAM must also hold dense weights, KV memory, and compute buffers. `-p 8192 -n 256` runs separate prompt-processing and generation tests; use `-pg 8192,256` for a combined prompt-and-generation test instead. For a disabled-cache comparison, replace `--moe-cache-mib 98304` with `--moe-cache-mib 0` and keep the other settings unchanged.
+
+### Blank-looking invalid argument after pasting
+
+If the command exits with `error: invalid parameter for argument:` followed by what looks like a blank space, check for nonbreaking spaces (U+00A0) introduced by rich-text copying. The shell does not treat these as ordinary spaces and can pass them as arguments. This can happen in the indentation of a multiline command, even when `--moe-cache-mib` appears correctly in the help output.
+
+Copy the single-line command above, or retype the indentation using ordinary ASCII spaces. For multiline commands, each continuation backslash must be the final character on its line, with no spaces after it. A parse failure happens before model loading and does not measure cache performance.
