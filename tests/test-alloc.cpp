@@ -22,6 +22,9 @@ struct dummy_backend_context {
     ggml_backend                       backend;
     std::vector<ggml_backend_buffer_t> buffers;
 
+    bool offload_moe   = false;
+    bool supports_moe = true;
+
     bool custom_alloc_buffer_n_called   = false;
     bool custom_get_alloc_size_n_called = false;
 
@@ -118,8 +121,14 @@ static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev
     return GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
-static bool dummy_backend_device_supports_op(ggml_backend_dev_t /*dev*/, const ggml_tensor * /*x*/) {
-    return true;
+static bool dummy_backend_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * x) {
+    auto * ctx = (dummy_backend_context *) dev->context;
+    return x->op != GGML_OP_MUL_MAT_ID || ctx->supports_moe;
+}
+
+static bool dummy_backend_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * x) {
+    auto * ctx = (dummy_backend_context *) dev->context;
+    return ctx->offload_moe && x->op == GGML_OP_MUL_MAT_ID && x->src[2]->ne[1] >= 32;
 }
 
 static bool dummy_backend_device_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
@@ -156,6 +165,7 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     b.context->device.context             = b.context.get();
     b.context->device.iface.get_type      = dummy_backend_device_get_type;
     b.context->device.iface.supports_op   = dummy_backend_device_supports_op;
+    b.context->device.iface.offload_op    = dummy_backend_device_offload_op;
     b.context->device.iface.supports_buft = dummy_backend_device_supports_buft;
 
     b.context->backend.context        = b.context.get();
@@ -1099,6 +1109,60 @@ static void test_buft_get_alloc_size_n_does_not_allocate() {
     GGML_ASSERT(x[1]->data == nullptr);
 }
 
+// Exercise scheduler placement without requiring GPU hardware or executing dummy buffers.
+static void test_moe_offload(int n_tokens, bool op_offload, bool second_supports, bool second_offloads, bool pinned) {
+    auto gpu0 = dummy_backend_init(1 << 20);
+    auto gpu1 = dummy_backend_init(1 << 20);
+    auto cpu  = dummy_backend_init(1 << 20);
+    gpu0.context->offload_moe = true;
+    gpu1.context->offload_moe = second_offloads;
+    gpu1.context->supports_moe = second_supports;
+    ggml_backend_t backends[] = { &gpu0.context->backend, &gpu1.context->backend, &cpu.context->backend };
+    ggml_backend_buffer_type_t bufts[] = { &gpu0.buffer_type, &gpu1.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 3, 256, false, op_offload));
+
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        ggml_backend_sched_reset(sched.get());
+        auto c = make_context();
+        ggml_tensor * weights = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 8, 8, 4);
+        ggml_backend_buffer_ptr weight_buffer(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, ggml_nbytes(weights)));
+        ggml_backend_buffer_set_usage(weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        GGML_ASSERT(ggml_backend_tensor_alloc(weight_buffer.get(), weights, alloc_base) == GGML_STATUS_SUCCESS);
+        ggml_tensor * outputs[4][3];
+        for (int group = 0; group < 4; ++group) {
+            ggml_tensor * ids = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, 2, n_tokens);
+            ggml_set_input(ids);
+            ggml_tensor * input = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, 8, 1, n_tokens);
+            ggml_set_input(input);
+            outputs[group][0] = ggml_mul_mat_id(c.ctx, weights, input, ids);
+            outputs[group][1] = ggml_mul_mat_id(c.ctx, weights, input, ids);
+            outputs[group][2] = ggml_mul_mat_id(c.ctx, weights, outputs[group][0], ids);
+            for (auto * output : outputs[group]) {
+                ggml_set_output(output);
+                ggml_build_forward_expand(c.graph, output);
+                if (pinned) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), output, backends[0]);
+                }
+            }
+        }
+        // Misleading model-style names must not affect assignment.
+        ggml_set_name(weights, repeat == 0 ? "blk.999.ffn_exps" : "weights");
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), c.graph));
+        for (int group = 0; group < 4; ++group) {
+            int expected = 2;
+            if (pinned) {
+                expected = 0;
+            } else if (op_offload && n_tokens >= 32) {
+                expected = second_supports && second_offloads ? group % 2 : 0;
+            }
+            for (auto * output : outputs[group]) {
+                GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), output) == backends[expected]);
+            }
+        }
+        ggml_backend_sched_reset(sched.get());
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1107,6 +1171,12 @@ static void run(const char * name, void (*f)()) {
 }
 
 int main() {
+    run("test_moe_offload", []() { test_moe_offload(32, true, true, true, false); });
+    run("test_moe_offload_decode", []() { test_moe_offload(1, true, true, true, false); });
+    run("test_moe_offload_disabled", []() { test_moe_offload(32, false, true, true, false); });
+    run("test_moe_offload_unsupported", []() { test_moe_offload(32, true, false, true, false); });
+    run("test_moe_offload_declined", []() { test_moe_offload(32, true, true, false, false); });
+    run("test_moe_offload_pinned", []() { test_moe_offload(32, true, true, true, true); });
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
     run("test_tensor_larger_than_max_size", test_tensor_larger_than_max_size);

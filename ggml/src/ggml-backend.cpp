@@ -1065,8 +1065,13 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+struct ggml_backend_sched_moe_offload {
+    std::unordered_map<const ggml_tensor *, int> backend_ids;
+    int next_backend_id = 0;
+};
+
 // returns the backend that should be used for the node based on the current locations
-static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
+static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor, ggml_backend_sched_moe_offload & moe_offload) {
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
     if (cur_backend_id != -1) {
@@ -1116,8 +1121,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
-                    for (int b = 0; b < src_backend_id; b++) {
+                    const bool is_moe = tensor->op == GGML_OP_MUL_MAT_ID && i == 0;
+                    int first_backend_id = 0;
+                    bool new_group = false;
+                    if (is_moe) {
+                        // Gate, up, and down projections share the same expert IDs.
+                        const auto it = moe_offload.backend_ids.find(tensor->src[2]);
+                        new_group = it == moe_offload.backend_ids.end();
+                        first_backend_id = new_group ? moe_offload.next_backend_id : it->second;
+                    }
+                    for (int j = 0; j < src_backend_id; j++) {
+                        const int b = (first_backend_id + j) % src_backend_id;
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                            if (is_moe && new_group) {
+                                moe_offload.backend_ids[tensor->src[2]] = b;
+                                moe_offload.next_backend_id = (b + 1) % src_backend_id;
+                            }
                             SET_CAUSE(tensor, "1.off");
                             return b;
                         }
@@ -1232,13 +1251,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     graph->uid = ggml_graph_next_uid();
 
+    ggml_backend_sched_moe_offload moe_offload;
+
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         int * leaf_backend_id = &tensor_backend_id(leaf);
         // do not overwrite user assignments
         if (*leaf_backend_id == -1) {
-            *leaf_backend_id = ggml_backend_sched_backend_id_from_cur(sched, leaf);
+            *leaf_backend_id = ggml_backend_sched_backend_id_from_cur(sched, leaf, moe_offload);
         }
     }
 
@@ -1247,7 +1268,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         int * node_backend_id = &tensor_backend_id(node);
         // do not overwrite user assignments
         if (*node_backend_id == -1) {
-            *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
+            *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node, moe_offload);
 
 #if 0
             // src
@@ -1262,7 +1283,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
                 int * src_backend_id = &tensor_backend_id(src);
                 if (*src_backend_id == -1) {
-                    *src_backend_id = ggml_backend_sched_backend_id_from_cur(sched, src);
+                    *src_backend_id = ggml_backend_sched_backend_id_from_cur(sched, src, moe_offload);
                 }
             }
 #endif
