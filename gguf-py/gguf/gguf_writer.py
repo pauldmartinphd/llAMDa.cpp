@@ -1192,6 +1192,9 @@ class GGUFWriter:
     def add_rope_freq_base(self, value: float) -> None:
         self.add_float32(Keys.Rope.FREQ_BASE.format(arch=self.arch), value)
 
+    def add_rope_freq_base_spatial(self, value: float) -> None:
+        self.add_float32(Keys.Rope.FREQ_BASE_SPATIAL.format(arch=self.arch), value)
+
     def add_rope_scaling_type(self, value: RopeScalingType) -> None:
         self.add_string(Keys.Rope.SCALING_TYPE.format(arch=self.arch), value.value)
 
@@ -1348,6 +1351,9 @@ class GGUFWriter:
     def add_remove_extra_whitespaces(self, value: bool) -> None:
         self.add_bool(Keys.Tokenizer.REMOVE_EXTRA_WS, value)
 
+    def add_clean_spaces(self, value: bool) -> None:
+        self.add_bool(Keys.Tokenizer.CLEAN_SPACES, value)
+
     def add_precompiled_charsmap(self, charsmap: bytes) -> None:
         self.add_array(Keys.Tokenizer.PRECOMPILED_CHARSMAP, charsmap)
 
@@ -1395,6 +1401,9 @@ class GGUFWriter:
 
     def add_normalizer_strip_accents(self, value: bool) -> None:
         self.add_bool(Keys.Tokenizer.NORMALIZER_STRIP_ACCENTS, value)
+
+    def add_metaspace_prepend_scheme(self, value: str) -> None:
+        self.add_string(Keys.Tokenizer.METASPACE_PREPEND_SCHEME, value)
 
     def add_eot_token_id(self, id: int) -> None:
         self.add_uint32(Keys.Tokenizer.EOT_ID, id)
