@@ -141,7 +141,7 @@ run_completion_case() {
   local extra
   extra=$(completion_extra_args "$name")
   echo "=== [completion:$name] llama-completion --device $device (NDEV=$ndev) ==="
-  timeout 600 env GGML_HEXAGON_NDEV=$ndev ./bin/llama-completion \
+  timeout 600 env GGML_HEXAGON_NDEV=$ndev ./bin/llamda-completion \
       -m "$MODEL_PATH" \
       -f "$prompt" \
       $extra \
@@ -164,7 +164,7 @@ run_bench_case() {
   local ubatch_arg=""
   [ "$name" = "npu" ] && ubatch_arg="--ubatch-size 1024"
   echo "=== [bench:$name] llama-bench --device $device (NDEV=$ndev) ==="
-  timeout 600 env GGML_HEXAGON_NDEV=$ndev ./bin/llama-bench \
+  timeout 600 env GGML_HEXAGON_NDEV=$ndev ./bin/llamda-bench \
       -m "$MODEL_PATH" \
       --device "$device" \
       -ngl 99 \

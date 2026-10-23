@@ -1,4 +1,6 @@
-# llAMDa.cpp
+# llamda
+
+This fork builds `llamda`, `llamda-server`, `llamda-cli`, `llamda-bench`, and other `llamda-*` executables. CMake target names and the `libllama` API remain unchanged: `cmake --build build --target llama-server` produces `build/bin/llamda-server`. When following upstream launch examples below, replace the executable prefix `llama` with `llamda`. Rebuilding an existing directory does not remove old `llama-*` binaries; use a fresh build directory to avoid running a stale executable.
 
 I maintain this fork to bring useful AMD performance work into one place without requiring a collection of custom launchers. The hardware I care about includes older Vega cards, RDNA2 cards such as the Radeon Pro V620, and Strix Halo. These systems have different execution and memory constraints, so a change that helps one of them needs an appropriate device or workload condition before it becomes a default for the others.
 
