@@ -1,12 +1,14 @@
 # llama.cpp: RDNA development
 
+This fork builds `llamda`, `llamda-server`, `llamda-cli`, `llamda-bench`, and other `llamda-*` executables. CMake target names and the `libllama` API remain unchanged: `cmake --build build --target llama-server` produces `build/bin/llamda-server`. When following upstream launch examples below, replace the executable prefix `llama` with `llamda`. Rebuilding an existing directory does not remove old `llama-*` binaries; use a fresh build directory to avoid running a stale executable.
+
 The shared [MoE prefill patch](docs/moe-prefill-offload.md) distributes eligible expert work by layer, with round-robin fallback, and bypasses routing readback at high selection density. Both parts are enabled by default; set `GGML_MOE_PREFILL=0` for an A/B comparison.
 
 DeepSeek-V4.1 and DSpark now use the shared Daniel Han / Unsloth implementation from `amd-main`. The older V4.1 port is superseded. [Matching models, instructions and known issues](docs/deepseek41.md).
 
 `rdna-dev` is the RDNA2/RDNA3 development branch of my AMD llama.cpp fork. It carries the former `v620-dev` integration, rebased onto `amd-main`, including the V620 kernels, DeepSeek-V4.1/DSpark support, expert-cache experiments, and model-specific sidecars. The broader development features retain their own build and runtime requirements.
 
-The default branch, [`amd-main`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/amd-main), contains the selected common AMD patches. [`halo-dev`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/halo-dev) and [`vega-dev`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/vega-dev) carry the corresponding architecture development work. Source credits are in [CREDITS.md](CREDITS.md) and [CREDITS-AMD.md](CREDITS-AMD.md).
+The default branch, [`amd-main`](https://github.com/pauldmartinphd/llamda/tree/amd-main), contains the selected common AMD patches. [`halo-dev`](https://github.com/pauldmartinphd/llamda/tree/halo-dev) and [`vega-dev`](https://github.com/pauldmartinphd/llamda/tree/vega-dev) carry the corresponding architecture development work. Source credits are in [CREDITS.md](CREDITS.md) and [CREDITS-AMD.md](CREDITS-AMD.md).
 
 This fork keeps the RDNA2/gfx1030 and RDNA3/gfx1100 paths separate. Use only
 the section matching the GPU you are building for.

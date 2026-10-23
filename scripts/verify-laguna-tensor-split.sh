@@ -8,7 +8,7 @@ PORT="${LAGUNA_VERIFY_PORT:-19090}"
 TIMEOUT_SECONDS="${LAGUNA_VERIFY_TIMEOUT:-300}"
 ARTIFACT_DIR="${LAGUNA_ARTIFACT_DIR:-/home/edwin/models/laguna/UD-IQ4_XS/diagnostics}"
 
-SERVER="$ROOT/build/bin/llama-server"
+SERVER="$ROOT/build/bin/llamda-server"
 TEST_META="$ROOT/build/bin/test-meta-split"
 TEST_TENSOR="$ROOT/build/bin/test-tensor-split"
 mkdir -p "$ARTIFACT_DIR"

@@ -1,0 +1,26 @@
+# Keep upstream target and library names; brand only executable filenames.
+function(llamda_name_executables directory)
+    get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(target IN LISTS targets)
+        get_target_property(type "${target}" TYPE)
+        if (NOT type STREQUAL "EXECUTABLE")
+            continue()
+        endif()
+
+        get_target_property(name "${target}" OUTPUT_NAME)
+        if (NOT name)
+            set(name "${target}")
+        endif()
+        if (name MATCHES "^llama(-|$)")
+            string(REGEX REPLACE "^llama" "llamda" name "${name}")
+            set_target_properties("${target}" PROPERTIES OUTPUT_NAME "${name}")
+        endif()
+    endforeach()
+
+    get_property(subdirectories DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+    foreach(subdirectory IN LISTS subdirectories)
+        llamda_name_executables("${subdirectory}")
+    endforeach()
+endfunction()
+
+llamda_name_executables("${CMAKE_CURRENT_SOURCE_DIR}")

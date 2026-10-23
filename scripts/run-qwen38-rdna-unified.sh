@@ -80,7 +80,7 @@ fi
     fail "REQUIRE_GPUS must be all or a positive integer"
 [[ $CTX_SIZE =~ ^[1-9][0-9]*$ ]] || fail "CTX_SIZE must be a positive integer"
 [[ -x $ROCM_PATH/bin/amd-smi ]] || fail "AMD SMI not found under $ROCM_PATH"
-SERVER=$BUILD_DIR/bin/llama-server
+SERVER=$BUILD_DIR/bin/llamda-server
 [[ -x $SERVER ]] || fail "server not found: $SERVER"
 [[ -f $MODEL && -f $MMPROJ ]] || fail "model/projector file missing"
 SOURCE_FILE=$(dirname "$MODEL")/SOURCE.txt

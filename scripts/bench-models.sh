@@ -38,7 +38,7 @@ run_model() {
     printf -- "- \`llama-batched-bench\`\n" | tee -a "$RESULTS"
     printf "\n" | tee -a "$RESULTS"
 
-    ./bin/llama-batched-bench \
+    ./bin/llamda-batched-bench \
         -hfr "${HFR}" -hff "${HFF}" \
         -m "${HFF}" -fa 1 -ub 2048 \
         ${ARGS_BB} | tee -a "$RESULTS"
@@ -48,7 +48,7 @@ run_model() {
     printf -- "- \`llama-bench\`\n" | tee -a "$RESULTS"
     printf "\n" | tee -a "$RESULTS"
 
-    ./bin/llama-bench \
+    ./bin/llamda-bench \
         -m "${HFF}" -fa 1 -ub 2048 \
         ${ARGS_B} | tee -a "$RESULTS"
 

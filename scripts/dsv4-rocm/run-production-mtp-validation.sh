@@ -5,7 +5,7 @@ set -Eeuo pipefail
 ROOT_DIR=${DSV4_ROOT_DIR:-/home/edwin/llama.cpp-rdna2}
 MODEL=${DSV4_MODEL:-/home/edwin/models/DeepSeek-V4-Flash-0731-GGUF/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf}
 DRAFT_MODEL=${DSV4_DRAFT_MODEL:-/home/edwin/models/DeepSeek-V4-Flash-MTP-GGUF/DeepSeek-V4-Flash-MTP-Q4_0.gguf}
-SERVER=${DSV4_SERVER:-$ROOT_DIR/build/bin/llama-server}
+SERVER=${DSV4_SERVER:-$ROOT_DIR/build/bin/llamda-server}
 CORPUS=${DSV4_PROMPT_FILE:-$ROOT_DIR/scripts/dsv4-rocm/corpus/technical-proxy.txt}
 OUTPUT_DIR=${LLAMA_JOB_DIR:-${DSV4_OUTPUT_DIR:-$HOME/llama-jobs/dsv4-production-mtp-$(date -u +%Y%m%dT%H%M%S.%NZ)}}
 BASE_PORT=${DSV4_PORT:-18240}

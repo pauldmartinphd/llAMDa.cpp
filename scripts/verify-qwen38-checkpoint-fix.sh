@@ -74,7 +74,7 @@ cmake --build build -j "$JOBS" --target \
 env LC_ALL=C "$EVIDENCE/verify-evidence.sh" > "$OUT/evidence.log" 2>&1
 
 ./scripts/reproduce-qwen38-checkpoint-crash.sh \
-    --server "$ROOT/build/bin/llama-server" \
+    --server "$ROOT/build/bin/llamda-server" \
     --out "$OUT/stress" \
     --port "$PORT" \
     --cycles "$CYCLES" \

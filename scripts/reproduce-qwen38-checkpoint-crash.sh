@@ -2,7 +2,7 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-SERVER="$ROOT/build/bin/llama-server"
+SERVER="$ROOT/build/bin/llamda-server"
 CLIENT="$ROOT/scripts/reproduce-qwen38-long-checkpoint-rewind.py"
 MODEL=/home/edwin/models/qwen38-27b-q4s8/unsloth-q8/Qwen3.8-27B-Q8_0.gguf
 DRAFT=/home/edwin/models/qwen38-27b-q4s8/draft-q4/Qwen3.8-27B-MTP-Draft-Q4_0.gguf

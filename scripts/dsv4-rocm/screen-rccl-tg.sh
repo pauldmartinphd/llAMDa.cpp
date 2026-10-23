@@ -72,7 +72,7 @@ export DSV4_TG_DEPTH_STATE_API=context
 export DSV4_HASH_MODE=full
 export DSV4_LABEL=raw-tg-rccl-screen-$candidate
 export DSV4_MODEL=/home/edwin/models/DeepSeek-V4-Flash-0731-GGUF/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf
-export DSV4_BENCH="$ROOT_DIR/build/bin/llama-bench"
+export DSV4_BENCH="$ROOT_DIR/build/bin/llamda-bench"
 export DSV4_BATCH=512 DSV4_UBATCH=256 DSV4_THREADS=12
 export DSV4_TENSOR_SPLIT=1/1/1/1 DSV4_CACHE_TYPE_K=f16 DSV4_CACHE_TYPE_V=f16 DSV4_LOAD_MODE=mmap
 export DSV4_REQUIRE_ACCEPTED_STACK=1 DSV4_ALLOW_BUSY_GPUS=0

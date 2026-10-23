@@ -215,7 +215,7 @@ if [[ -z "$JOBS" ]]; then
 fi
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || fail "JOBS must be a positive integer"
 
-if pgrep -f "^$BUILD_DIR/bin/llama-server" >/dev/null 2>&1; then
+if pgrep -f "^$BUILD_DIR/bin/llamda-server" >/dev/null 2>&1; then
     fail "llama-server from this build is running; stop it before rebuilding"
 fi
 
@@ -255,7 +255,7 @@ echo "  target: $TARGET_ARCH"
 cmake -S "$ROOT_DIR" -B "$BUILD_DIR" "${CMAKE_FLAGS[@]}"
 cmake --build "$BUILD_DIR" --config "$BUILD_TYPE" --parallel "$JOBS"
 
-SERVER="$BUILD_DIR/bin/llama-server"
+SERVER="$BUILD_DIR/bin/llamda-server"
 [[ -x "$SERVER" ]] || fail "server binary was not produced: $SERVER"
 if ! compgen -G "$BUILD_DIR/bin/*ggml-hip*.so*" >/dev/null 2>&1; then
     fail "HIP backend library was not produced under $BUILD_DIR/bin"

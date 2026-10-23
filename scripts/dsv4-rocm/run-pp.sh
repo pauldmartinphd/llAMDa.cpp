@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MODEL=${DSV4_MODEL:-/home/edwin/models/DeepSeek-V4-Flash-0731-GGUF/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf}
-BENCH=${DSV4_BENCH:-$ROOT_DIR/build/bin/llama-bench}
+BENCH=${DSV4_BENCH:-$ROOT_DIR/build/bin/llamda-bench}
 OUTPUT_ROOT=${DSV4_OUTPUT_ROOT:-$HOME/llama-jobs/dsv4-rocm-pp}
 PROMPTS=${DSV4_PROMPTS:-512,2048}
 UBATCHES=${DSV4_UBATCHES:-256}

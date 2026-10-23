@@ -220,7 +220,7 @@ if [[ -z "$JOBS" ]]; then
 fi
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || fail "JOBS must be a positive integer"
 
-if pgrep -f "^$BUILD_DIR/bin/llama-server" >/dev/null 2>&1; then
+if pgrep -f "^$BUILD_DIR/bin/llamda-server" >/dev/null 2>&1; then
     fail "llama-server from this build is running; stop it before rebuilding"
 fi
 
@@ -270,7 +270,7 @@ if [[ "$BUILD_TESTS" == ON || "$BUILD_TESTS" == 1 || "$BUILD_TESTS" == TRUE || "
 fi
 cmake --build "$BUILD_DIR" --target "${targets[@]}" --config "$BUILD_TYPE" --parallel "$JOBS"
 
-SERVER="$BUILD_DIR/bin/llama-server"
+SERVER="$BUILD_DIR/bin/llamda-server"
 HIP_LIB="$BUILD_DIR/bin/libggml-hip.so"
 [[ -x "$SERVER" && -e "$HIP_LIB" ]] || fail "server/HIP backend artifacts were not produced"
 if [[ "$BUILD_SIDECARS" == ON || "$BUILD_SIDECARS" == 1 || "$BUILD_SIDECARS" == TRUE || "$BUILD_SIDECARS" == on || "$BUILD_SIDECARS" == true ]]; then

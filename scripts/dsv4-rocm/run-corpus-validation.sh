@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MODEL=${DSV4_MODEL:-/home/edwin/models/DeepSeek-V4-Flash-0731-GGUF/UD-IQ2_M/DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf}
-SERVER=${DSV4_SERVER:-$ROOT_DIR/build/bin/llama-server}
+SERVER=${DSV4_SERVER:-$ROOT_DIR/build/bin/llamda-server}
 CORPUS=${DSV4_PROMPT_FILE:-$ROOT_DIR/scripts/dsv4-rocm/corpus/technical-proxy.txt}
 OUTPUT_ROOT=${DSV4_OUTPUT_ROOT:-$HOME/llama-jobs/dsv4-corpus-validation}
 BASE_PORT=${DSV4_PORT:-18180}

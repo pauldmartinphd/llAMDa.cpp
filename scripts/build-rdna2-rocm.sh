@@ -17,7 +17,7 @@ command -v cmake >/dev/null 2>&1 || fail "cmake is not installed"
 [ -x "$ROCM_PATH/llvm/bin/clang" ] || fail "ROCm HIP compiler not found under $ROCM_PATH"
 [ -f "$ROCM_PATH/lib/librccl.so" ] || fail "RCCL library not found: $ROCM_PATH/lib/librccl.so"
 
-if pgrep -f "^$BUILD_DIR/bin/llama-server" >/dev/null 2>&1; then
+if pgrep -f "^$BUILD_DIR/bin/llamda-server" >/dev/null 2>&1; then
     fail "llama-server from this build is running; stop it before rebuilding"
 fi
 
@@ -45,13 +45,13 @@ CMAKE_FLAGS=(
 
 echo "Building RDNA2 ROCm/RCCL server"
 echo "  source: $ROOT_DIR"
-echo "  output: $BUILD_DIR/bin/llama-server"
+echo "  output: $BUILD_DIR/bin/llamda-server"
 echo "  target: $TARGET_ARCH"
 
 cmake -S "$ROOT_DIR" -B "$BUILD_DIR" "${CMAKE_FLAGS[@]}"
 cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
 
-SERVER="$BUILD_DIR/bin/llama-server"
+SERVER="$BUILD_DIR/bin/llamda-server"
 HIP_LIB="$BUILD_DIR/bin/libggml-hip.so.0"
 
 [ -x "$SERVER" ] || fail "server binary was not produced"

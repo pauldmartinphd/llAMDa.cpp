@@ -119,7 +119,7 @@ targets=(llama-server)
 if [[ $BUILD_TESTS == ON ]]; then targets+=(test-backend-ops); fi
 cmake --build "$BUILD_DIR" --target "${targets[@]}" --parallel "$JOBS"
 
-SERVER=$BUILD_DIR/bin/llama-server
+SERVER=$BUILD_DIR/bin/llamda-server
 HIP_LIB=$BUILD_DIR/bin/libggml-hip.so
 [[ -x $SERVER && -e $HIP_LIB ]] || fail "expected server/HIP artifacts were not produced"
 if [[ $BUILD_SIDECARS == ON ]]; then
