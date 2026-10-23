@@ -61,6 +61,7 @@ test parameters:
   --cpu-strict <0|1>                        (default: 0)
   --poll <0...100>                          (default: 50)
   -ngl, --n-gpu-layers <n>                  (default: -1)
+  --moe-cache-mib <n>                     total GPU expert cache MiB (default: 0; lists/ranges supported)
   -ncmoe, --n-cpu-moe <n>                   (default: 0)
   -sm, --split-mode <none|layer|row|tensor> (default: layer)
   -mg, --main-gpu <i>                       (default: 0)
@@ -389,3 +390,19 @@ CREATE TABLE IF NOT EXISTS llama_bench (
 INSERT INTO llama_bench (build_commit, build_number, cpu_info, gpu_info, backends, model_filename, model_type, model_size, model_n_params, n_batch, n_ubatch, n_threads, cpu_mask, cpu_strict, poll, type_k, type_v, n_gpu_layers, n_cpu_moe, split_mode, main_gpu, no_kv_offload, flash_attn, devices, tensor_split, tensor_buft_overrides, use_mmap, use_direct_io, embeddings, no_op_offload, no_host, repack, fit_target, fit_min_ctx, n_prompt, n_gen, n_depth, test_time, avg_ns, stddev_ns, avg_ts, stddev_ts) VALUES ('8cf427ff', '5163', 'AMD Ryzen 7 7800X3D 8-Core Processor', 'NVIDIA GeForce RTX 4080', 'CUDA', 'models/Qwen2.5-7B-Instruct-Q4_K_M.gguf', 'qwen2 7B Q4_K - Medium', '4677120000', '7615616512', '2048', '512', '8', '0x0', '0', '50', 'f16', 'f16', '-1', '0', 'layer', '0', '0', '-1', 'auto', '0.00', 'none', '1', '0', '0', '0', '0', '1', '0', '0', '512', '0', '0', '2025-04-24T12:00:08Z', '69905000', '519516', '7324.546977', '54.032613');
 INSERT INTO llama_bench (build_commit, build_number, cpu_info, gpu_info, backends, model_filename, model_type, model_size, model_n_params, n_batch, n_ubatch, n_threads, cpu_mask, cpu_strict, poll, type_k, type_v, n_gpu_layers, n_cpu_moe, split_mode, main_gpu, no_kv_offload, flash_attn, devices, tensor_split, tensor_buft_overrides, use_mmap, use_direct_io, embeddings, no_op_offload, no_host, repack, fit_target, fit_min_ctx, n_prompt, n_gen, n_depth, test_time, avg_ns, stddev_ns, avg_ts, stddev_ts) VALUES ('8cf427ff', '5163', 'AMD Ryzen 7 7800X3D 8-Core Processor', 'NVIDIA GeForce RTX 4080', 'CUDA', 'models/Qwen2.5-7B-Instruct-Q4_K_M.gguf', 'qwen2 7B Q4_K - Medium', '4677120000', '7615616512', '2048', '512', '8', '0x0', '0', '50', 'f16', 'f16', '-1', '0', 'layer', '0', '0', '-1', 'auto', '0.00', 'none', '1', '0', '0', '0', '0', '1', '0', '0', '0', '128', '0', '2025-04-24T12:00:09Z', '1063608780', '4464130', '120.346696', '0.504647');
 ```
+
+## Expert cache benchmarking
+
+Use `--moe-cache-mib` to compare cache budgets, including `0` for the disabled baseline:
+
+```sh
+./build/bin/llamda-bench -m /path/to/model.gguf \
+  -ngl 99 -ncmoe 999 --split-mode layer --tensor-split 1,1,1,1 \
+  --moe-cache-mib 0,4096,8192 -fa 1 -t 32 -p 512 -n 128 -r 5 -o jsonl
+```
+
+`-ncmoe 999` keeps routed experts in host memory for models with up to 999 layers; dense and shared-expert weights remain eligible for GPU placement. The cache budget is total across devices, divided like the layers, not a budget per GPU. Leave enough VRAM for the cache, dense weights, KV cache, and compute buffers.
+
+The budget supports the same lists and ranges as other benchmark parameters, for example `0-8192+4096`. Each combination creates a fresh context and expert cache. Warmup and repetitions within that combination reuse the cache; clearing KV memory does not clear expert weights. `--no-warmup -r 1` measures a single initially cold run. Normal repetitions include cache population and reuse, rather than guaranteeing a fully warm cache. Synthetic benchmark tokens may have different expert reuse from real prompts.
+
+JSON, JSONL, CSV, and SQL include `moe_cache_mib`; Markdown shows the column when a nondefault budget or sweep is selected. This records the requested budget, not measured cache occupancy. Use `-v` for the existing cache allocation and hit/miss diagnostics on stderr. These benchmarks measure target inference, not MTP or DSpark acceptance.
