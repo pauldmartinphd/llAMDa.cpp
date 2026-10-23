@@ -15,7 +15,7 @@ PROMPT_FILE="$1"; shift
 PORT="${PORT:-8899}"
 NEEDLE="${NEEDLE:-}"
 N_PREDICT="${N_PREDICT:-128}"
-BIN="${BIN:-./build/bin/llama-server}"
+BIN="${BIN:-./build/bin/llamda-server}"
 LOG="/tmp/bench-spf-$LABEL.log"
 
 "$BIN" --port "$PORT" --no-webui "$@" > "$LOG" 2>&1 &
