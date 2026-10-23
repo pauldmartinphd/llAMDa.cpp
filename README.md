@@ -1,14 +1,16 @@
 # llama.cpp: Vega development
 
+This fork builds `llamda`, `llamda-server`, `llamda-cli`, `llamda-bench`, and other `llamda-*` executables. CMake target names and the `libllama` API remain unchanged: `cmake --build build --target llama-server` produces `build/bin/llamda-server`. When following upstream launch examples below, replace the executable prefix `llama` with `llamda`. Rebuilding an existing directory does not remove old `llama-*` binaries; use a fresh build directory to avoid running a stale executable.
+
 The shared [MoE prefill patch](docs/moe-prefill-offload.md) distributes eligible expert work by layer, with round-robin fallback, and bypasses routing readback at high selection density. Both parts are enabled by default; set `GGML_MOE_PREFILL=0` for an A/B comparison.
 
 DeepSeek-V4.1 and DSpark now use the shared Daniel Han / Unsloth implementation from `amd-main`. The older V4.1 port is superseded. [Matching models, instructions and known issues](docs/deepseek41.md).
 
-I keep the shared AMD changes in [`amd-main`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/amd-main). This branch carries the remaining work from [mxxm-t/mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) for Vega development, including gfx906 weight repacking, multi-stage tensor parallelism, and speculative decoding work. It includes experimental and opt-in features that have not been promoted to the common branch.
+I keep the shared AMD changes in [`amd-main`](https://github.com/pauldmartinphd/llamda/tree/amd-main). This branch carries the remaining work from [mxxm-t/mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp) for Vega development, including gfx906 weight repacking, multi-stage tensor parallelism, and speculative decoding work. It includes experimental and opt-in features that have not been promoted to the common branch.
 
 The source history and authorship are preserved. Integration details, source revision and validation limits are in [the integration notes](docs/vega-dev-integration.md). Shared patch credits are in [CREDITS-AMD.md](CREDITS-AMD.md).
 
-The development branches are [`rdna-dev`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/rdna-dev), [`halo-dev`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/halo-dev), and [`vega-dev`](https://github.com/pauldmartinphd/llAMDa.cpp/tree/vega-dev).
+The development branches are [`rdna-dev`](https://github.com/pauldmartinphd/llamda/tree/rdna-dev), [`halo-dev`](https://github.com/pauldmartinphd/llamda/tree/halo-dev), and [`vega-dev`](https://github.com/pauldmartinphd/llamda/tree/vega-dev).
 
 ## Source fork documentation
 
